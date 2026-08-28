@@ -198,6 +198,25 @@ enum class OuterWallMode {
     // surface move. No over-extrusion into the inner walls, no reserved-space
     // requirement, same visual effect.
     Centered = 1,
+    // Pure surface displacement: the line width and the volumetric flow are
+    // left EXACTLY as the perimeter generator set them, and only the wall's
+    // position moves, by +/- image_map_wall_offset_distance.
+    //
+    // This exists because modes 0/1 produce the colour swing by *thinning* the
+    // extrusion, which has two failure modes that show up badly on real models:
+    //   - Pushed hard (a small configured min line width) they ask for
+    //     extrusions far below what a nozzle can lay down -- a 0.05 mm minimum
+    //     on a 0.42 mm wall yields ~0.07 mm lines, which simply do not extrude,
+    //     leaving voids in the wall.
+    //   - Because re-widthing bridged material is not safe, loops containing
+    //     overhang paths have to be skipped, so on sloped regions (a hull
+    //     bottom, a roof) modulated and unmodulated loops sit side by side and
+    //     the surface breaks up -- while straight vertical walls, treated
+    //     uniformly, look fine.
+    // Holding the width constant removes both: nothing can be thinner than what
+    // the slicer already chose, and since flow is untouched there is no reason
+    // to skip overhang loops, so every external perimeter is treated alike.
+    OffsetOnly = 2,
 };
 
 // Result of modulating one external perimeter.
@@ -235,13 +254,22 @@ float max_surface_offset_mm(float nozzle_diameter_mm);
 // base_outer_width == nominal, so 0.5 * width_delta == 0.5 * (nominal - new)),
 // and which makes the outer surface move by exactly (new_width - nominal).
 //
+// In OffsetOnly mode the width is left alone entirely and the surface is
+// displaced by up to `offset_distance_mm` instead:
+//   inward_only == false -> weight 0..1 maps to -d/2 .. +d/2 about nominal
+//   inward_only == true  -> weight 0..1 maps to -d   .. 0    (never grows)
+//
 //   weight                in [0,1] from Solver::weight_for(); 1 = the active
 //                         filament fully matches the painted target colour
 //   path_nominal_width_mm the width the perimeter generator assigned
 //   config_min/max_mm     texture_mapping_outer_wall_gradient_{min,max}_line_width
+//                         (unused in OffsetOnly mode)
 //   global_strength_pct   texture_mapping_outer_wall_gradient_global_strength
 //   layer_height_mm       for the positive-spacing lower bound
-//   nozzle_diameter_mm    for max_surface_offset_mm()
+//   nozzle_diameter_mm    for max_surface_offset_mm(), and for the minimum
+//                         *printable* width floor in the width-modulating modes
+//   offset_distance_mm    image_map_wall_offset_distance (OffsetOnly only)
+//   inward_only           image_map_wall_offset_inward_only (OffsetOnly only)
 WallModulation compute_wall_modulation(float         weight,
                                        float         path_nominal_width_mm,
                                        float         config_min_width_mm,
@@ -249,7 +277,16 @@ WallModulation compute_wall_modulation(float         weight,
                                        float         global_strength_pct,
                                        float         layer_height_mm,
                                        float         nozzle_diameter_mm,
-                                       OuterWallMode mode);
+                                       OuterWallMode mode,
+                                       float         offset_distance_mm = 0.15f,
+                                       bool          inward_only        = false);
+
+// Smallest width worth asking a nozzle to extrude: half the nozzle diameter
+// (0.2 mm on a 0.4 mm nozzle), floored at 0.05 mm. The width-modulating modes
+// clamp to this regardless of texture_mapping_outer_wall_gradient_min_line_width,
+// whose own lower bound of 0.05 mm is small enough to request lines that do not
+// physically extrude and leave voids in the wall.
+float min_printable_width_mm(float nozzle_diameter_mm);
 
 // Offset a closed ring of points by `delta` (scaled units) using miter joins,
 // preserving the vertex count so the caller can write the result back into the

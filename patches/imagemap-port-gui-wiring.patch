@@ -1,14 +1,16 @@
 diff --git a/src/slic3r/GUI/Tab.cpp b/src/slic3r/GUI/Tab.cpp
-index 5b7ec39..23b364b 100644
+index 5b7ec39..4a5c185 100644
 --- a/src/slic3r/GUI/Tab.cpp
 +++ b/src/slic3r/GUI/Tab.cpp
-@@ -3527,6 +3527,16 @@ void TabPrint::build()
+@@ -3527,6 +3527,18 @@ void TabPrint::build()
          optgroup->append_single_option_line("solid_infill_filament");
          optgroup->append_single_option_line("wall_filament");
  
 +        optgroup = page->new_optgroup(L("Image map per-layer color (experimental)"), L"param_special");
 +        optgroup->append_single_option_line("image_map_per_layer_color_rotation");
 +        optgroup->append_single_option_line("image_map_outer_wall_mode");
++        optgroup->append_single_option_line("image_map_wall_offset_distance");
++        optgroup->append_single_option_line("image_map_wall_offset_inward_only");
 +        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_global_strength");
 +        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_max_line_width");
 +        optgroup->append_single_option_line("texture_mapping_outer_wall_gradient_min_line_width");

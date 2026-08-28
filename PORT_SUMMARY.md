@@ -90,13 +90,13 @@ and commit; all original license headers are intact below the provenance note.
 
 | File | Change |
 |---|---|
-| `src/libslic3r/PrintConfig.cpp/.hpp` | 8 new options (below), all `comDevelop`, defaults inert |
-| `src/libslic3r/Preset.cpp` | The 8 keys added to the print-options list |
+| `src/libslic3r/PrintConfig.cpp/.hpp` | 10 new options (below), all `comDevelop`, defaults inert |
+| `src/libslic3r/Preset.cpp` | The 10 keys added to the print-options list |
 | `src/libslic3r/GCode/ToolOrdering.hpp` | `LayerTools::image_map_filament_resolution` map + identity `resolve_image_map()`; declaration + rotation accessor |
 | `src/libslic3r/GCode/ToolOrdering.cpp` | The four `resolve_mixed(result)` sites become `resolve_image_map(resolve_mixed(result))`; `resolve_image_map_per_layer_filaments()` called from both `sort_and_build_data` overloads right after `resolve_mixed_filaments()` |
 | `src/libslic3r/GCode.hpp/.cpp` | Solver member + `init_image_map_per_layer_color()` (called once in `do_export`) + `image_map_modulate_outer_wall_loop()`, called on the by-value loop copy at the top of `extrude_loop()`. **Phase 2 replaced Phase 1's `_extrude` shim with this**: `_extrude()` is back to its original signature and body |
 | `src/CMakeLists.txt`, `src/libslic3r/CMakeLists.txt` | `add_subdirectory` for the three vendored libs; `colorsolver` added to `libslic3r`'s link list; new module sources registered |
-| `src/slic3r/GUI/Tab.cpp` (`patches/imagemap-port-gui-wiring.patch`, applied separately by `apply.sh`) | New "Image map per-layer color (experimental)" optgroup in Process Settings > Others, wiring all 7 options into the UI (visible once Preferences > Develop mode is on; previously the options existed only in the config schema with no UI control) |
+| `src/slic3r/GUI/Tab.cpp` (`patches/imagemap-port-gui-wiring.patch`, applied separately by `apply.sh`) | New "Image map per-layer color (experimental)" optgroup in Process Settings > Others, wiring all 10 options into the UI (visible once Preferences > Develop mode is on; previously the options existed only in the config schema with no UI control) |
 
 ## The default-off toggle
 
@@ -111,9 +111,14 @@ and commit; all original license headers are intact below the provenance note.
   * `image_map_generic_solver_lookup_mode` (int, 0 = closest mix)
   * `image_map_generic_solver_mode` (int, 255 = slicer default → Oklab soft-cap)
   * `image_map_generic_solver_mix_model` (int, 0 = Pigment Painter)
-  * `image_map_outer_wall_mode` (int, **Phase 2**, 0 = inward only, 1 = centered)
-    — how far and in which direction the modulated wall's surface may move; see
+  * `image_map_outer_wall_mode` (int, **Phase 2**, 0 = narrow inward,
+    1 = narrow centered, **2 = offset only, the default**) — how the wall
+    approximates the painted colour; see
     [Phase 2](#phase-2-outer-wall-surface-offsetting)
+  * `image_map_wall_offset_distance` (float mm, **Phase 2**, default 0.15,
+    max 0.35) — peak surface displacement in offset-only mode
+  * `image_map_wall_offset_inward_only` (bool, **Phase 2**, default false) —
+    offset-only mode moves the wall inward only, preserving outer dimensions
 
 Changing any of these keys triggers a full reslice (they are intentionally not
 listed in `Print::invalidate_state_by_config_options`, whose fallback branch
@@ -287,8 +292,9 @@ that shift, which is what makes the wall's surface genuinely move.
 | | width sweep | surface moves | inner edge |
 |---|---|---|---|
 | Phase 1 (shipped) | nominal → min | inward by ½ the width loss | **drifts inward, opening a void** |
-| `Inward` (mode 0, default) | nominal → min | inward by the full width loss | fixed |
+| `Inward` (mode 0) | nominal → min | inward by the full width loss | fixed |
 | `Centered` (mode 1) | max → min, spanning nominal | **outward *and* inward** around nominal | fixed |
+| `OffsetOnly` (mode 2, **default**) | **none — width untouched** | outward and/or inward by the configured distance | moves with the wall |
 
 Both Phase 2 modes pin the wall's inner edge by shifting the centerline exactly
 half the width change:
@@ -348,13 +354,57 @@ This also *replaces* Phase 1's `_extrude` shim: `_extrude()` reverts to its
 original signature and body, and the feature's only G-code-side hook is now the
 one line at the top of `extrude_loop`.
 
+### Why `OffsetOnly` is the default (the Benchy regression)
+
+Modes 0 and 1 create the colour swing by **thinning** the extrusion. Verified
+against the real `3DBenchy_H2C_Multi_Color_Test_Print.3mf`, that turned out to
+have two failure modes that ruin real models, both visible as voids in the wall
+and a broken-up surface concentrated at the **top and bottom** of the model
+while the middle looked fine:
+
+1. **Unextrudable lines.** The project had
+   `texture_mapping_outer_wall_gradient_min_line_width` at its 0.05 mm floor
+   (and max at 3 mm). The width-modulating modes honoured that literally,
+   asking for **~0.07 mm external perimeters on a 0.4 mm nozzle**. Those do not
+   extrude, and the missing material shows up as white speckling across the
+   surface. Fixed generally by flooring the width at
+   `min_printable_width_mm()` = `max(0.05, nozzle/2)` — 0.20 mm on a 0.4 mm
+   nozzle — regardless of what the config asks for. This floor is **not** in
+   the origin and is a deliberate addition.
+2. **Overhang loops had to be skipped.** Re-widthing bridged material is not
+   safe, so modes 0/1 skip any loop containing an overhang path. On a straight
+   vertical wall that never happens and the surface is uniform; on a sloped
+   region — a hull bottom, a roof — modulated and unmodulated loops end up
+   side by side and the surface breaks up. That is precisely the "middle is
+   fine, top and bottom are weird" signature.
+
+`OffsetOnly` has neither problem *by construction*: it leaves `width` and
+`mm3_per_mm` exactly as the perimeter generator set them and only translates
+the ring, so nothing can be thinner than what the slicer already chose, and
+there is no longer any reason to skip overhang loops — every external perimeter
+is treated alike. It is therefore the default (`image_map_outer_wall_mode = 2`).
+
+Its two settings:
+
+* `image_map_wall_offset_distance` (float mm, default **0.15**, max 0.35) —
+  peak surface displacement. Larger = stronger colour, rougher surface.
+* `image_map_wall_offset_inward_only` (bool, default **false**) — when on, the
+  wall only ever moves inward, preserving the model's outer dimensions; when
+  off it swings symmetrically ±d/2 about nominal.
+
+**Note for existing projects:** a 3MF saved before this change has
+`image_map_outer_wall_mode = 0` stored in it and will keep using the
+width-modulating path (now with the printable-width floor). Switch it to 2 to
+get the new behaviour.
+
 ### What Phase 2 deliberately skips
 
-* **Loops containing overhang paths are left entirely alone.** They are
-  bridged/unsupported material with their own flow and speed handling. They
-  would have to move with the rest of the ring to keep it connected, but
-  re-widthing them is not safe, and shifting them without re-widthing would push
-  them into the wall behind.
+* **In the width-modulating modes only (0 and 1), loops containing overhang
+  paths are left entirely alone.** They are bridged/unsupported material with
+  their own flow and speed handling. They would have to move with the rest of
+  the ring to keep it connected, but re-widthing them is not safe, and shifting
+  them without re-widthing would push them into the wall behind. `OffsetOnly`
+  does not have this restriction (see above).
 * **`reduce_outer_surface_texture`** (origin `GCode.cpp:11121`) is a *per-path
   average* correction: it re-centers the mean centerline shift across a path's
   segments. With a constant weight per path there is no per-segment variation to

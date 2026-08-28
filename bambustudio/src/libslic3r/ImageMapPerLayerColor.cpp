@@ -309,6 +309,12 @@ float max_surface_offset_mm(float nozzle_diameter_mm)
     return std::clamp(safe_reference, 0.01f, 0.35f);
 }
 
+float min_printable_width_mm(float nozzle_diameter_mm)
+{
+    const float nozzle = std::max(0.05f, std::abs(nozzle_diameter_mm));
+    return std::max(0.05f, 0.5f * nozzle);
+}
+
 WallModulation compute_wall_modulation(float         weight,
                                        float         path_nominal_width_mm,
                                        float         config_min_width_mm,
@@ -316,7 +322,9 @@ WallModulation compute_wall_modulation(float         weight,
                                        float         global_strength_pct,
                                        float         layer_height_mm,
                                        float         nozzle_diameter_mm,
-                                       OuterWallMode mode)
+                                       OuterWallMode mode,
+                                       float         offset_distance_mm,
+                                       bool          inward_only)
 {
     WallModulation out;
 
@@ -324,13 +332,40 @@ WallModulation compute_wall_modulation(float         weight,
     const float layer_height = std::max(0.01f, layer_height_mm);
     const float strength = std::clamp(global_strength_pct / 100.f, 0.f, 1.f);
     const float cap = max_surface_offset_mm(nozzle_diameter_mm);
+    const float w_clamped = std::clamp(weight, 0.f, 1.f);
+
+    // -----------------------------------------------------------------------
+    // OffsetOnly: width and flow untouched, only the surface position moves.
+    // -----------------------------------------------------------------------
+    if (mode == OuterWallMode::OffsetOnly) {
+        const float distance = std::clamp(offset_distance_mm, 0.f, cap);
+        // weight 1 (the active filament matches the painted colour) puts the
+        // wall at its most prominent; weight 0 makes it recede so the
+        // neighbouring layers' colours read instead.
+        const float surface_offset = (inward_only ? (w_clamped - 1.f) * distance
+                                                  : (2.f * w_clamped - 1.f) * 0.5f * distance) *
+                                     strength;
+        if (!std::isfinite(surface_offset) || std::abs(surface_offset) > cap + 1e-4f)
+            return out;
+
+        out.width_mm = nominal;                     // untouched
+        out.flow_scale = 1.0;                       // untouched
+        out.surface_offset_mm = surface_offset;
+        out.centerline_shift_mm = -surface_offset;  // + shift = toward material
+        out.active = std::abs(surface_offset) > 1e-3f;
+        return out;
+    }
 
     // Lower bound on the width: the configured minimum, but never below the
     // width at which the rounded-rectangle cross-section's spacing turns
-    // negative. Ported verbatim from origin GCode.cpp:10967
-    // (min_width_for_positive_spacing_mm).
+    // negative (ported verbatim from origin GCode.cpp:10967,
+    // min_width_for_positive_spacing_mm), and never below what the nozzle can
+    // actually lay down. That last floor is not in the origin and is deliberate:
+    // texture_mapping_outer_wall_gradient_min_line_width bottoms out at 0.05 mm,
+    // and honouring that literally asks for ~0.07 mm external perimeters on a
+    // 0.4 mm nozzle, which do not extrude and leave voids in the wall.
     const float min_width_for_positive_spacing = layer_height * float(1. - 0.25 * M_PI) + 1e-4f;
-    const float hard_min = std::max(0.05f, min_width_for_positive_spacing);
+    const float hard_min = std::max({0.05f, min_width_for_positive_spacing, min_printable_width_mm(nozzle_diameter_mm)});
 
     // The width sweep [lo, hi]. Both ends are clamped so the resulting surface
     // never moves further than `cap` from nominal, mirroring the origin's
@@ -352,8 +387,7 @@ WallModulation compute_wall_modulation(float         weight,
 
     // weight 1 -> widest (the active filament matches the painted colour, so
     // deposit the full line); weight 0 -> narrowest.
-    const float w = std::clamp(weight, 0.f, 1.f);
-    const float raw_width = lo + w * (hi - lo);
+    const float raw_width = lo + w_clamped * (hi - lo);
     // The global strength scales the whole swing about the nominal width, so
     // strength 0 is an exact no-op in both modes.
     // Scaling about the nominal width keeps `width` inside [lo, hi] on its own;

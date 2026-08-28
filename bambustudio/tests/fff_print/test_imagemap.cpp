@@ -126,6 +126,13 @@ WallModulation modulate(float weight, OuterWallMode mode, float strength = 100.f
         weight, kNominal, kMinWidth, kMaxWidth, strength, kLayerHeight, kNozzle, mode);
 }
 
+WallModulation offset_only(float weight, float distance, bool inward_only, float strength = 100.f)
+{
+    return Slic3r::ImageMapPerLayer::compute_wall_modulation(
+        weight, kNominal, kMinWidth, kMaxWidth, strength, kLayerHeight, kNozzle,
+        OuterWallMode::OffsetOnly, distance, inward_only);
+}
+
 // Where the wall's inner edge ends up, relative to the nominal inner edge.
 // The centerline shift is positive toward the material, so the inner edge sits
 // at (-shift - width/2) and the nominal one at (-nominal/2).
@@ -210,7 +217,7 @@ TEST_CASE("imagemap: surface movement is capped at the nozzle-derived limit", "[
     }
 }
 
-TEST_CASE("imagemap: zero strength is an exact no-op in both modes", "[ImageMapPerLayerColor]")
+TEST_CASE("imagemap: zero strength is an exact no-op in every mode", "[ImageMapPerLayerColor]")
 {
     for (OuterWallMode mode : {OuterWallMode::Inward, OuterWallMode::Centered}) {
         for (int i = 0; i <= 4; ++i) {
@@ -218,6 +225,82 @@ TEST_CASE("imagemap: zero strength is an exact no-op in both modes", "[ImageMapP
             REQUIRE(!m.active);
         }
     }
+    for (int i = 0; i <= 4; ++i)
+        REQUIRE(!offset_only(float(i) / 4.f, 0.15f, false, 0.f).active);
+}
+
+// This is the regression that produced the voids on a real Benchy: the project
+// had texture_mapping_outer_wall_gradient_min_line_width cranked to its 0.05 mm
+// floor, and the width-modulating modes honoured it literally, asking for
+// ~0.07 mm external perimeters on a 0.4 mm nozzle. Those do not extrude.
+TEST_CASE("imagemap: width-modulating modes never request an unextrudable line", "[ImageMapPerLayerColor]")
+{
+    REQUIRE(Slic3r::ImageMapPerLayer::min_printable_width_mm(0.40f) == Approx(0.20f));
+    REQUIRE(Slic3r::ImageMapPerLayer::min_printable_width_mm(0.20f) == Approx(0.10f));
+    REQUIRE(Slic3r::ImageMapPerLayer::min_printable_width_mm(0.06f) == Approx(0.05f)); // 0.05 mm floor
+
+    for (OuterWallMode mode : {OuterWallMode::Inward, OuterWallMode::Centered}) {
+        for (int i = 0; i <= 10; ++i) {
+            // The exact configuration off the failing Benchy project: min 0.05,
+            // max 3.0, full strength.
+            const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(
+                float(i) / 10.f, kNominal, 0.05f, 3.0f, 100.f, kLayerHeight, kNozzle, mode);
+            REQUIRE(m.width_mm >= Slic3r::ImageMapPerLayer::min_printable_width_mm(kNozzle) - 1e-4f);
+        }
+    }
+}
+
+TEST_CASE("imagemap: OffsetOnly moves the wall without touching width or flow", "[ImageMapPerLayerColor]")
+{
+    const float d = 0.15f;
+
+    // Centered: symmetric swing, and width/flow are left strictly alone.
+    const WallModulation full = offset_only(1.f, d, false);
+    const WallModulation none = offset_only(0.f, d, false);
+    const WallModulation mid  = offset_only(0.5f, d, false);
+
+    REQUIRE(full.width_mm == Approx(kNominal));
+    REQUIRE(none.width_mm == Approx(kNominal));
+    REQUIRE(full.flow_scale == Approx(1.0));
+    REQUIRE(none.flow_scale == Approx(1.0));
+
+    REQUIRE(full.surface_offset_mm == Approx(+0.5f * d).margin(1e-4));
+    REQUIRE(none.surface_offset_mm == Approx(-0.5f * d).margin(1e-4));
+    REQUIRE(!mid.active); // dead centre: nothing to move
+
+    // The shift is the negation of the surface movement: positive shift shoves
+    // the centerline toward the material, so the surface recedes.
+    REQUIRE(full.centerline_shift_mm == Approx(-full.surface_offset_mm).margin(1e-6));
+    REQUIRE(none.centerline_shift_mm == Approx(-none.surface_offset_mm).margin(1e-6));
+
+    // Inward-only: never grows the part, and spends the whole distance inward.
+    const WallModulation in_full = offset_only(1.f, d, true);
+    const WallModulation in_none = offset_only(0.f, d, true);
+    REQUIRE(!in_full.active);                       // weight 1 == nominal position
+    REQUIRE(in_none.surface_offset_mm == Approx(-d).margin(1e-4));
+    for (int i = 0; i <= 10; ++i)
+        REQUIRE(offset_only(float(i) / 10.f, d, true).surface_offset_mm <= 1e-4f);
+
+    // Monotone in the weight, both variants.
+    for (bool inward_only : {false, true}) {
+        float previous = -1e9f;
+        for (int i = 0; i <= 10; ++i) {
+            const WallModulation m = offset_only(float(i) / 10.f, d, inward_only);
+            REQUIRE(m.surface_offset_mm >= previous);
+            REQUIRE(m.width_mm == Approx(kNominal));
+            previous = m.surface_offset_mm;
+        }
+    }
+}
+
+TEST_CASE("imagemap: OffsetOnly respects the surface-offset cap", "[ImageMapPerLayerColor]")
+{
+    // Ask for far more than the cap allows, in both variants and at both ends.
+    for (bool inward_only : {false, true})
+        for (int i = 0; i <= 10; ++i) {
+            const WallModulation m = offset_only(float(i) / 10.f, 10.0f, inward_only);
+            REQUIRE(std::abs(m.surface_offset_mm) <= 0.35f + 1e-3f);
+        }
 }
 
 TEST_CASE("imagemap: offset_closed_ring() miters a square inward and preserves vertices", "[ImageMapPerLayerColor]")
