@@ -14,10 +14,25 @@ if [ -z "$TARGET" ] || [ ! -d "$TARGET/src/libslic3r" ]; then
 fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-# 1. New files (vendored color libraries + the ported module).
+# 1. New files (vendored color libraries + the ported module + a unit test).
 cp -rv "$HERE/bambustudio/src/." "$TARGET/src/"
+cp -rv "$HERE/bambustudio/tests/." "$TARGET/tests/"
 
 # 2. Modifications to existing BambuStudio files.
-git -C "$TARGET" apply --verbose "$HERE/patches/imagemap-port-modified-files.patch"
+for PATCH in \
+    "$HERE/patches/imagemap-port-modified-files.patch" \
+    "$HERE/patches/imagemap-port-gui-wiring.patch" \
+    "$HERE/patches/imagemap-port-tests.patch"; do
+    if git -C "$TARGET" apply --check "$PATCH" 2>/dev/null; then
+        git -C "$TARGET" apply --verbose "$PATCH"
+    elif git -C "$TARGET" apply --check -R "$PATCH" 2>/dev/null; then
+        echo "$(basename "$PATCH") already applied to $TARGET, skipping."
+    else
+        echo "$(basename "$PATCH") does not apply cleanly to $TARGET (and isn't already applied)." >&2
+        exit 1
+    fi
+done
 
 echo "Done. Feature toggle: image_map_per_layer_color_rotation (default off)."
+echo "GUI: Preferences > Develop mode, then Process Settings > Others > 'Image map per-layer color (experimental)'."
+echo "Test: cmake -DSLIC3R_BUILD_TESTS=ON <build dir>, then build+run the 'imagemap_tests' target."

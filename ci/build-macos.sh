@@ -77,6 +77,21 @@ log "Applying the ImageMap per-layer-color port"
 "$REPO_ROOT/apply.sh" "$SRC_DIR"
 
 # --------------------------------------------------------------------------
+log "Aligning deps/CMakeLists.txt's hardcoded macOS deployment target with MIN_OSX_VERSION"
+# --------------------------------------------------------------------------
+# deps/CMakeLists.txt force-sets CMAKE_OSX_DEPLOYMENT_TARGET to "10.15"
+# regardless of what's passed on the cmake command line. Recent SDKs (Xcode
+# 16+ / very new Command Line Tools) no longer support libc++ below macOS
+# 11.0: the resulting availability #warning gets promoted to a hard error by
+# deps that build with -Werror (TBB, Boost's nowide), breaking the deps
+# build. Align the forced value with MIN_OSX_VERSION so deps and the app
+# agree on the same floor. A no-op if the string was already changed (e.g.
+# by upstream) or on a rerun.
+sed -i '' \
+  "s/set(CMAKE_OSX_DEPLOYMENT_TARGET \"10\.15\" CACHE STRING \"Minimum OS X deployment version\" FORCE)/set(CMAKE_OSX_DEPLOYMENT_TARGET \"$MIN_OSX_VERSION\" CACHE STRING \"Minimum OS X deployment version\" FORCE)/" \
+  "$SRC_DIR/deps/CMakeLists.txt"
+
+# --------------------------------------------------------------------------
 if [ -f "$DEPS_TARBALL" ]; then
   log "Restoring cached dependency build from $(basename "$DEPS_TARBALL")"
   mkdir -p "$DEPS_DIR"

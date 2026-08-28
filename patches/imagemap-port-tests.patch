@@ -1,0 +1,31 @@
+diff --git a/tests/fff_print/CMakeLists.txt b/tests/fff_print/CMakeLists.txt
+index 7e08708..958f9d0 100644
+--- a/tests/fff_print/CMakeLists.txt
++++ b/tests/fff_print/CMakeLists.txt
+@@ -44,3 +44,26 @@ if (MSVC)
+ endif()
+ set_property(TARGET support_material_on_wipe_tower_tests PROPERTY FOLDER "tests")
+ add_test(support_material_on_wipe_tower_tests support_material_on_wipe_tower_tests ${CATCH_EXTRA_ARGS})
++
++add_executable(imagemap_tests
++	fff_print_tests.cpp
++	test_data.cpp
++	test_data.hpp
++	test_imagemap.cpp
++	)
++target_link_libraries(imagemap_tests test_common libslic3r libslic3r_gui
++	libcurl
++	OpenSSL::SSL OpenSSL::Crypto
++)
++if (MSVC)
++	target_link_options(imagemap_tests PRIVATE /FORCE:UNRESOLVED)
++endif()
++set_property(TARGET imagemap_tests PROPERTY FOLDER "tests")
++# Filter to this port's own tag. test_data.cpp is linked in for its mesh() /
++# init_print() helpers and drags its own upstream "Scenario: init_print
++# functionality" TEST_CASE along with it; that scenario fails ("Objects could
++# not fit on the bed") on stock BambuStudio 02.08.02.61 independently of this
++# port -- the whole upstream fff_print_tests target does not even compile
++# against this version any more (test_gcodewriter.cpp references a
++# GCodeWriter::lift() and a GCodeConfig::retract_lift that no longer exist).
++add_test(imagemap_tests imagemap_tests "[ImageMapPerLayerColor]" ${CATCH_EXTRA_ARGS})

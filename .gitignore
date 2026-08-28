@@ -1,3 +1,4 @@
 /build/
 BambuStudio_dep_mac_*.tar.gz
 BambuStudio_*_ImageMap.dmg
+.DS_Store

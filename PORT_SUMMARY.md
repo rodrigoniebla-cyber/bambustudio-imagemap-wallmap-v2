@@ -1,4 +1,10 @@
-# Phase 1 Port: "One Tool-Change Per Layer" Image/Texture Printing → Bambu Studio
+# Port: "One Tool-Change Per Layer" Image/Texture Printing → Bambu Studio
+
+**Phase 1** — per-layer color solver, outer-wall line-width modulation, and
+tool-change collapsing.
+**Phase 2** — the variable-wall half: the outer wall's *surface* now actually
+moves, in and out, instead of only changing line width in place. See
+[Phase 2: outer-wall surface offsetting](#phase-2-outer-wall-surface-offsetting).
 
 Port of the per-layer color solver, outer-wall line-width modulation, and
 tool-change-collapsing logic from
@@ -84,12 +90,13 @@ and commit; all original license headers are intact below the provenance note.
 
 | File | Change |
 |---|---|
-| `src/libslic3r/PrintConfig.cpp/.hpp` | 7 new options (below), all `comDevelop`, defaults inert |
-| `src/libslic3r/Preset.cpp` | The 7 keys added to the print-options list |
+| `src/libslic3r/PrintConfig.cpp/.hpp` | 8 new options (below), all `comDevelop`, defaults inert |
+| `src/libslic3r/Preset.cpp` | The 8 keys added to the print-options list |
 | `src/libslic3r/GCode/ToolOrdering.hpp` | `LayerTools::image_map_filament_resolution` map + identity `resolve_image_map()`; declaration + rotation accessor |
 | `src/libslic3r/GCode/ToolOrdering.cpp` | The four `resolve_mixed(result)` sites become `resolve_image_map(resolve_mixed(result))`; `resolve_image_map_per_layer_filaments()` called from both `sort_and_build_data` overloads right after `resolve_mixed_filaments()` |
-| `src/libslic3r/GCode.hpp/.cpp` | Solver member + `init_image_map_per_layer_color()` (called once in `do_export`) + `image_map_apply_outer_wall_modulation()`; `_extrude` gains a 2-line shim that substitutes a re-widthed copy of the path only when the helper returns true |
+| `src/libslic3r/GCode.hpp/.cpp` | Solver member + `init_image_map_per_layer_color()` (called once in `do_export`) + `image_map_modulate_outer_wall_loop()`, called on the by-value loop copy at the top of `extrude_loop()`. **Phase 2 replaced Phase 1's `_extrude` shim with this**: `_extrude()` is back to its original signature and body |
 | `src/CMakeLists.txt`, `src/libslic3r/CMakeLists.txt` | `add_subdirectory` for the three vendored libs; `colorsolver` added to `libslic3r`'s link list; new module sources registered |
+| `src/slic3r/GUI/Tab.cpp` (`patches/imagemap-port-gui-wiring.patch`, applied separately by `apply.sh`) | New "Image map per-layer color (experimental)" optgroup in Process Settings > Others, wiring all 7 options into the UI (visible once Preferences > Develop mode is on; previously the options existed only in the config schema with no UI control) |
 
 ## The default-off toggle
 
@@ -104,6 +111,9 @@ and commit; all original license headers are intact below the provenance note.
   * `image_map_generic_solver_lookup_mode` (int, 0 = closest mix)
   * `image_map_generic_solver_mode` (int, 255 = slicer default → Oklab soft-cap)
   * `image_map_generic_solver_mix_model` (int, 0 = Pigment Painter)
+  * `image_map_outer_wall_mode` (int, **Phase 2**, 0 = inward only, 1 = centered)
+    — how far and in which direction the modulated wall's surface may move; see
+    [Phase 2](#phase-2-outer-wall-surface-offsetting)
 
 Changing any of these keys triggers a full reslice (they are intentionally not
 listed in `Print::invalidate_state_by_config_options`, whose fallback branch
@@ -122,12 +132,12 @@ Every touched code path, traced with the toggle off:
    unchanged. Identical return values, no side effects.
 3. **`GCode::init_image_map_per_layer_color`** — sets
    `m_image_map_modulation_enabled = false` and returns at the toggle check.
-4. **`GCode::_extrude`** — the shim calls
-   `image_map_apply_outer_wall_modulation()`, whose first statement returns
-   false when `m_image_map_modulation_enabled` is false; `path` then aliases
-   the original parameter (same object, including for `ExtrusionPathSloped`,
-   whose later `dynamic_cast` still sees the derived object). The remainder of
-   `_extrude` is textually unchanged.
+4. **`GCode::extrude_loop`** — the added call to
+   `image_map_modulate_outer_wall_loop()` returns false at its first statement
+   when `m_image_map_modulation_enabled` is false, without reading or writing
+   `loop`. The remainder of `extrude_loop` is textually unchanged, and
+   `_extrude` is no longer touched at all (Phase 2 removed Phase 1's shim
+   there).
 5. **Vendored libraries** — linked into the binary but no code path calls into
    them unless the solver is initialized, which only happens behind the toggle.
 6. **Config plumbing** — new options only add defaulted values.
@@ -202,22 +212,162 @@ If both features are configured at once, the port refuses to activate
    `layer_index`; for multiple objects of different heights printed "by layer"
    it is an approximation. The wall-modulation side is index-independent (it
    keys off the actual active tool), so the two sides cannot disagree.
-3. **Per-path (not per-segment) width modulation**: with painting, the color
-   target is constant per region, so a constant width per path is exact for the
-   solver output; the origin's per-segment image sampling, dithering, halftone
-   and centerline-shift machinery is Phase 2/3 scope. Consequence: narrowed
-   walls recede slightly inward (outer surface texture), as in the origin's
-   non-vertex "offset gradient" mode; the outward "vertex color match" mode
-   (base width = configured max) was *not* ported because it requires the
-   centerline-shift geometry to keep dimensions accurate.
+3. **Per-loop (not per-segment) modulation**: with painting, the color target is
+   constant per region, so a constant width and centerline shift per loop is
+   exact for the solver output; the origin's per-segment image sampling,
+   dithering and halftone machinery is Phase 3 scope. The centerline shift
+   itself *is* ported as of Phase 2 (see
+   [Phase 2](#phase-2-outer-wall-surface-offsetting)); the origin's
+   vertex-color-match widening is ported in adapted form (inner edge pinned
+   rather than slice surfaces inset), which is the one deliberate deviation.
 4. **Wipe-tower sizing**: fewer per-layer tool changes shrink wipe-tower
    partitions via the existing (`fill_wipe_tower_partitions`) logic after the
    collapse. This is the intended benefit but has not been exercised end-to-end.
 
-## Out of scope (Phase 2/3, per task)
+## Bugs found and fixed via real-world verification
+
+The feature was verified end-to-end against a real multi-color H2C project
+(`3DBenchy_H2C_Multi_Color_Test_Print.3mf`, 9 declared filament slots, 4
+actually painted onto the model, toggle on, no support). The first slice with
+the toggle on showed **no improvement at all** (711 filament changes over 240
+layers — the same as with the toggle off). Root-causing this against real
+data (not synthetic test objects) surfaced three real defects, now fixed:
+
+1. **`ToolOrdering::resolve_image_map_per_layer_filaments()`'s mixed-filament
+   guard checked the entire project's `filament_is_mixed` array**, not just
+   the filaments in the rotation set. Any project with a virtual/mixed AMS
+   filament slot configured *anywhere* — even one never used by the object
+   being sliced — silently disabled the feature for the whole print. Fixed to
+   only bail out on filaments that are actually part of the rotation set.
+2. **`rotation_filaments()`'s candidate derivation was unreliable in both
+   directions on real projects.** The original implementation enumerated
+   `print.num_print_regions()`, which Bambu Studio pre-creates one-per-
+   declared-filament-slot regardless of usage — over-including unused/
+   unrelated slots (this alone reproduced bug #1 above even after fixing the
+   guard's scope, since the polluted candidate set still contained the unused
+   mixed slot). Switching to `Print::object_extruders()` fixed the
+   over-inclusion but then *under*-included a color that was genuinely
+   painted and extruded on every layer, depending on the volume's paint data
+   shape.
+3. **Fix**: `ToolOrdering::resolve_image_map_per_layer_filaments()` now
+   derives the rotation set directly from `m_layer_tools[*].extruders` — the
+   real, already-resolved per-layer extruder lists that literally feed the
+   resulting G-code — instead of any Print-level config/region/paint
+   heuristic. `GCode::init_image_map_per_layer_color()` was changed to read
+   that same authoritative set via `print.tool_ordering().image_map_rotation_filaments()`
+   instead of independently recomputing it, so tool-change collapsing and
+   outer-wall width modulation can never disagree. `ImageMapPerLayer::rotation_filaments()`
+   (the original free function) remains as a lighter-weight, pre-slicing
+   estimate — documented as such in `ImageMapPerLayerColor.hpp` — but is no
+   longer on the critical path.
+
+After all three fixes, the same Benchy project dropped from 711 filament
+changes to **239 over 240 layers** — i.e. one change per layer, matching the
+feature's design intent.
+
+## Phase 2: outer-wall surface offsetting
+
+### The bug Phase 1 shipped with
+
+Phase 1 changed an external perimeter's `width` and `mm3_per_mm` and left its
+toolpath centerline exactly where the perimeter generator put it. That is not
+what the origin does, and on its own it is geometrically wrong. Narrowing an
+extrusion in place moves *both* of its edges: the outer surface comes in by
+only **half** the width loss, and an equal gap opens on the **inner** side,
+between the outer wall and the wall behind it. So Phase 1 got half the intended
+color swing and paid for it with a growing void inside the wall stack.
+
+The origin never does this. Every width change is paired with a centerline
+shift along the segment's inward normal (origin `GCode.cpp` ~11108:
+`centerline_shift = base_centerline_shift + 0.5 * width_delta`). Phase 2 ports
+that shift, which is what makes the wall's surface genuinely move.
+
+### What moves, and how far
+
+| | width sweep | surface moves | inner edge |
+|---|---|---|---|
+| Phase 1 (shipped) | nominal → min | inward by ½ the width loss | **drifts inward, opening a void** |
+| `Inward` (mode 0, default) | nominal → min | inward by the full width loss | fixed |
+| `Centered` (mode 1) | max → min, spanning nominal | **outward *and* inward** around nominal | fixed |
+
+Both Phase 2 modes pin the wall's inner edge by shifting the centerline exactly
+half the width change:
+
+```
+shift = 0.5 * (nominal_width - new_width)      // + = toward the material
+```
+
+so `centerline - width/2` is invariant and the surface moves by exactly
+`new_width - nominal_width`. For mode 0 this is *identical* to the origin's
+offset-gradient shift (there `base_outer_width == nominal`, so
+`0.5 * width_delta == 0.5 * (nominal - new)`).
+
+Surface movement is capped in both directions by a port of
+`TextureMappingManager::max_component_surface_offset_mm()` (origin
+`TextureMapping.cpp:2219`): `clamp(|nozzle diameter|, 0.01, 0.35)` mm. The
+origin applies the same number as `max_width_delta_limit = min(effective_delta,
+2 * max_allowed_distance)` (origin `GCode.cpp:11026`).
+
+### Deliberate deviation from the origin's "vertex color match"
+
+The origin's vertex-color-match mode widens the wall to
+`texture_mapping_outer_wall_gradient_max_line_width` (default 0.95 mm vs a
+0.42 mm nominal) about a centerline pre-shifted **inward** by
+`0.5 * (max - nominal)`. That keeps the *outer* surface honest but leaves the
+wall's inner edge ~0.2 mm inside the nominal one — straight through the wall
+behind it. The origin can afford that because it *also* insets the slice
+surfaces at perimeter-generation time
+(`texture_mapping_offset_surface_inset_mm`, origin `LayerRegion.cpp`) so the
+space is reserved before the walls are ever laid out.
+
+That slice-time inset is a large, invasive piece of machinery and is Phase 3
+scope here. Porting the origin's shift **without** it would over-extrude every
+widened wall into its neighbor. So mode 1 instead pins the inner edge and lets
+only the outer surface travel. It gets the same visual effect and a comparable
+color range, needs no reserved space, and cannot over-extrude.
+
+### Applied per loop, not per segment
+
+The origin samples an image texture per path *segment*, so it displaces each
+segment's endpoints individually inside its G-code emission loop
+(`OuterWallGradientSegmentMod`). Here the color target of a painted region is
+constant, so the weight — and therefore both the width and the shift — is
+constant along a whole external perimeter loop.
+
+That lets the shift be applied **once**, as a miter offset of the closed loop,
+at the top of `GCode::extrude_loop()` — before seam placement, loop clipping and
+scarf-seam construction ever see the geometry, all of which then operate on the
+already-offset wall. `ImageMapPerLayer::offset_closed_ring()` does the offset
+with proper miter joins, preserving the vertex count so the result can be
+written straight back into the individual `ExtrusionPath`s that make up the ring.
+It refuses (leaving the caller's geometry untouched) on degenerate rings and
+whenever the offset would collapse or invert the ring — which is what happens on
+a feature thinner than twice the offset.
+
+This also *replaces* Phase 1's `_extrude` shim: `_extrude()` reverts to its
+original signature and body, and the feature's only G-code-side hook is now the
+one line at the top of `extrude_loop`.
+
+### What Phase 2 deliberately skips
+
+* **Loops containing overhang paths are left entirely alone.** They are
+  bridged/unsupported material with their own flow and speed handling. They
+  would have to move with the rest of the ring to keep it connected, but
+  re-widthing them is not safe, and shifting them without re-widthing would push
+  them into the wall behind.
+* **`reduce_outer_surface_texture`** (origin `GCode.cpp:11121`) is a *per-path
+  average* correction: it re-centers the mean centerline shift across a path's
+  segments. With a constant weight per path there is no per-segment variation to
+  average, so it is a no-op by construction and was not ported.
+* Loops whose paths do not all share one width, or whose junctions are not
+  exact, are skipped rather than approximated.
+
+## Out of scope (Phase 3)
 
 Texture/image import, vertex-color import UI, gradient/halftone/projection
-panels, per-segment sampling and dithering, top-surface contoning
+panels, per-segment sampling and dithering, the slice-time surface inset
+(`texture_mapping_offset_surface_inset_mm`) that would allow the origin's true
+vertex-color-match widening, top-surface contoning
 (`TextureMappingContoning`), the raw-filament offset atlas, prime-tower image
 painting, and 3MF persistence of zone definitions.
 
@@ -239,9 +389,53 @@ painting, and 3MF persistence of zone definitions.
   * ColorSolver: a component color solves to weight ≈ 1.0 for itself; a mixed
     target yields weights summing to 1.0; both the prusa-fdm-mixer path and
     the Pigment Painter path (embedded-PNG LUT decode) produce sane output.
-* **Not performed**: a full Bambu Studio build (the dependency tree — OCCT,
-  OpenCV, wxWidgets, etc. — is not buildable in this environment), an
-  end-to-end slicing comparison, and any print on real hardware. No claim is
-  made that the feature produces correct colors on a physical printer; the
-  disabled-state and H2C conclusions above are based on the code-path analysis
-  described, not on runtime evidence.
+* **Since performed** (superseding the paragraph below): a full macOS arm64
+  build (see `ci/build-macos.sh`), a Catch2 unit test
+  (`tests/fff_print/test_imagemap.cpp`, build with `-DSLIC3R_BUILD_TESTS=ON`,
+  target `imagemap_tests`) exercising `rotation_filaments()` against real
+  `Print`/`PrintRegion` objects, and an end-to-end CLI slicing comparison
+  against a real multi-color H2C project — see "Bugs found and fixed via
+  real-world verification" above, which the end-to-end test surfaced and this
+  port has since fixed.
+* **Phase 2** adds Catch2 coverage in the same `imagemap_tests` target for the
+  new geometry:
+  * `Inward` mode never widens past nominal, is monotone in the solver weight,
+    pulls the surface in by the *full* width loss (not half, as Phase 1 did),
+    and leaves the wall's inner edge exactly where it was at every weight.
+  * `Centered` mode moves the surface both outward and inward, keeps the inner
+    edge pinned in both directions, and yields a strictly larger colour range
+    than `Inward`.
+  * Surface movement stays inside the nozzle-derived cap even when the
+    configured max line width is absurd (3 mm); `max_surface_offset_mm()`
+    matches the origin's `clamp(nozzle, 0.01, 0.35)`.
+  * Strength 0 is an exact no-op in both modes.
+  * `offset_closed_ring()` miters a square exactly (corner lands on the inset
+    corner, not on an edge normal), works in both winding directions, grows on
+    a negative delta, and *refuses* — leaving the caller's geometry untouched —
+    on rings it would collapse or invert, on fewer than 3 points, and on a zero
+    delta.
+  All 8 cases / 123 assertions pass on macOS arm64 against the real built
+  `libslic3r`, alongside a full app build that runs and reports all 8 config
+  keys at their defaults (`image_map_outer_wall_mode = 0`, master toggle off).
+
+  Two notes on running them, both pre-existing upstream conditions rather than
+  anything this port introduces:
+  * `imagemap_tests` links upstream `tests/fff_print/test_data.cpp` for its
+    `mesh()` / `init_print()` helpers, which drags that file's own
+    `Scenario: init_print functionality` TEST_CASE in with it. That scenario
+    fails ("Objects could not fit on the bed") on stock BambuStudio
+    02.08.02.61 — the port does not touch `test_data.cpp`, and the whole
+    upstream `fff_print_tests` target no longer even *compiles* against this
+    version (`test_gcodewriter.cpp` calls a `GCodeWriter::lift()` and reads a
+    `GCodeConfig::retract_lift` that no longer exist). The `add_test()` entry
+    therefore filters to `[ImageMapPerLayerColor]`.
+  * `ctest` cannot launch any of BambuStudio's test targets on macOS — they
+    are built as `.app` bundles and `ctest` looks for a bare executable
+    (`libnest2d_tests` and every other upstream target fail identically). Run
+    the binary directly:
+    `./tests/fff_print/imagemap_tests.app/Contents/MacOS/imagemap_tests "[ImageMapPerLayerColor]"`.
+* **Not performed**: any print on real hardware, and no end-to-end slice
+  comparison of the Phase 2 geometry against a real project (the Phase 1
+  tool-change collapsing numbers above predate it, and were measured before
+  the centerline shift existed). No claim is made that the feature produces
+  correct colors on a physical printer.

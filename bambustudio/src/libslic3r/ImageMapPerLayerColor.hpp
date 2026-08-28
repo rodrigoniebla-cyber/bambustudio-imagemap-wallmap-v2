@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include "Point.hpp"
+
 #include "ColorSolver.hpp"
 
 namespace Slic3r {
@@ -39,22 +41,38 @@ namespace ImageMapPerLayer {
 // (the default) no caller may alter its behavior in any way.
 bool enabled(const PrintConfig &config);
 
-// 0-based filament ids used by object-body print regions (wall / solid infill /
-// sparse infill filaments — i.e. what per-object assignment and 3MF mmu
-// painting produce), excluding filaments used for support or support
-// interface anywhere in the print, sorted ascending.
+// 0-based filament ids used by object-body volumes (painted / per-part
+// assigned, via ModelVolume::get_extruders()), excluding filaments used for
+// support or support interface anywhere in the print, sorted ascending.
 //
-// This is the fixed rotation set the print cycles through, one filament per
-// layer. It is computed identically (and deterministically) by ToolOrdering
-// (tool-change collapsing) and GCode (outer-wall width modulation) so the two
-// stay consistent.
+// This is a Print-level *approximation* of the rotation set, useful before
+// any slicing has happened. It is NOT what ToolOrdering actually uses to
+// decide the live rotation set: on real multi-part/painted projects this was
+// found to disagree with reality in both directions versus the real per-layer
+// extruder usage --
+//   - enumerating print.num_print_regions() (an earlier version of this
+//     function) over-includes filament slots that are merely *declared*
+//     somewhere in the project's configuration but never actually used on
+//     this object (Bambu Studio pre-creates one PrintRegionConfig per
+//     configured filament slot regardless of usage) -- this was found to
+//     fully disable the feature on real projects that simply had an unused,
+//     unrelated virtual "mixed" AMS slot elsewhere in the filament list;
+//   - object_extruders()/get_extruders() itself can *under*-include a color
+//     that is genuinely extruded on every single layer, depending on how the
+//     paint/volume data happens to be structured.
+// ToolOrdering::resolve_image_map_per_layer_filaments() therefore derives the
+// authoritative rotation set directly from m_layer_tools[*].extruders (the
+// real, already-resolved per-layer extruder lists -- literally what feeds the
+// resulting G-code), not from this function; GCode::init_image_map_per_layer_color()
+// in turn reads that same authoritative set via
+// print.tool_ordering().image_map_rotation_filaments() so both sides of the
+// feature (tool-change collapsing and outer-wall width modulation) always
+// agree. This function remains as a lighter-weight, pre-slicing estimate.
 //
-// LOW-CONFIDENCE MAPPING NOTE: OrcaSlicer-ImageMap derives this set from its
-// own TextureMappingZone component ids (an explicit per-zone filament list).
-// Bambu Studio has no zones in Phase 1, so the set is derived from the print
-// regions the existing painting pipeline creates. Filaments also used as
-// support/support-interface are conservatively excluded so the support
-// tool-change path is never rerouted.
+// LOW-CONFIDENCE MAPPING NOTE: OrcaSlicer-ImageMap derives its rotation set
+// from explicit TextureMappingZone component ids (an explicit per-zone
+// filament list); Bambu Studio has no zones in Phase 1, hence the
+// volume/paint-based approximation here.
 std::vector<unsigned int> rotation_filaments(const Print &print);
 
 // Balanced per-layer sequence over the rotation set.
@@ -119,6 +137,11 @@ private:
 //   config_max_width_mm     texture_mapping_outer_wall_gradient_max_line_width (upper cap)
 //   global_strength_pct     texture_mapping_outer_wall_gradient_global_strength
 //   layer_height_mm         used for the positive-spacing lower bound
+//
+// Kept as the width-only entry point (Phase 1 behaviour, and the width half of
+// OuterWallMode::Inward). Phase 2 callers want compute_wall_modulation(),
+// which additionally returns the centerline shift that actually moves the
+// wall's outer surface.
 float modulated_outer_wall_width(float weight,
                                  float base_outer_width_mm,
                                  float config_min_width_mm,
@@ -130,6 +153,116 @@ float modulated_outer_wall_width(float weight,
 // cross-section (width x height) is re-issued at new_width. Returns 1 when the
 // inputs are degenerate.
 double flow_scale_for_width_change(float old_width_mm, float new_width_mm, float height_mm);
+
+// ---------------------------------------------------------------------------
+// Phase 2: outer-wall surface offsetting (the "variable wall" half).
+//
+// Phase 1 changed only the external perimeter's *line width*, leaving the
+// toolpath centerline where the perimeter generator put it. That is not what
+// the origin does, and on its own it is geometrically wrong: narrowing an
+// extrusion in place pulls the outer surface in by only half the width loss
+// and simultaneously opens an equal gap on the *inner* side, between the outer
+// wall and the wall behind it.
+//
+// The origin pairs every width change with a centerline shift (origin
+// GCode.cpp ~11108: centerline_shift = base_centerline_shift + 0.5 * width_delta,
+// applied along the segment's inward normal). Phase 2 ports that shift. Because
+// the port's colour target is constant per painted region, the weight — and so
+// the shift — is constant along a whole external perimeter loop, which lets the
+// shift be applied once as a clean miter offset of the closed loop rather than
+// the origin's per-segment point displacement.
+// ---------------------------------------------------------------------------
+
+// How the outer wall's surface is allowed to move relative to where the
+// unmodulated wall would have been.
+enum class OuterWallMode {
+    // Port of the origin's non-vertex "offset gradient" mode: the wall only
+    // ever narrows, so its outer surface only ever recedes *into* the model,
+    // by up to (nominal width - min width) * strength. The model never grows.
+    Inward = 0,
+    // Generalization of the origin's "vertex color match" mode: the width may
+    // also exceed the path's nominal width, so the surface swings symmetrically
+    // outward as well as inward around its nominal position. Gives a much
+    // larger colour swing at the cost of changing outer dimensions by up to
+    // the surface-offset cap (see max_surface_offset_mm()).
+    //
+    // DEVIATION FROM THE ORIGIN (deliberate): the origin's vertex-color-match
+    // widens the wall about a centerline pre-shifted inward by
+    // 0.5 * (max_line_width - nominal), which leaves the wall's *inner* edge
+    // far inside the nominal one, overlapping the wall behind it. The origin
+    // gets away with that because it also insets the slice surfaces at
+    // perimeter-generation time (origin LayerRegion.cpp,
+    // texture_mapping_offset_surface_inset_mm) so the space is reserved. That
+    // slice-time inset is Phase 3 scope here, so instead this mode pins the
+    // wall's inner edge to the nominal inner edge and lets only the outer
+    // surface move. No over-extrusion into the inner walls, no reserved-space
+    // requirement, same visual effect.
+    Centered = 1,
+};
+
+// Result of modulating one external perimeter.
+struct WallModulation
+{
+    // False when the modulation is a no-op and the caller should leave the
+    // loop exactly as it found it.
+    bool   active { false };
+    // New extrusion width, mm.
+    float  width_mm { 0.f };
+    // Distance to move the toolpath centerline, mm. Positive moves the
+    // centerline *toward the model's material* (so the outer surface recedes);
+    // negative moves it away (the surface bulges outward).
+    float  centerline_shift_mm { 0.f };
+    // Multiplier for the path's mm3_per_mm, relative to its nominal width.
+    double flow_scale { 1.0 };
+    // Signed distance the outer surface ends up from where it would have been,
+    // positive = outward. Diagnostics/tests only.
+    float  surface_offset_mm { 0.f };
+};
+
+// Hard cap on how far the outer surface may move from its nominal position,
+// in either direction. Port of TextureMappingManager::max_component_surface_offset_mm()
+// (origin TextureMapping.cpp:2219): clamp(|nozzle diameter|, 0.01, 0.35) mm.
+// The origin applies it as max_width_delta_limit = min(effective_delta,
+// 2 * max_allowed_distance) (origin GCode.cpp:11026).
+float max_surface_offset_mm(float nozzle_diameter_mm);
+
+// Width + centerline shift for one external perimeter.
+//
+// The centerline shift is chosen so the wall's inner edge stays exactly where
+// the perimeter generator put it:
+//     shift = 0.5 * (nominal_width - new_width)
+// which is identical to the origin's offset-gradient shift (there
+// base_outer_width == nominal, so 0.5 * width_delta == 0.5 * (nominal - new)),
+// and which makes the outer surface move by exactly (new_width - nominal).
+//
+//   weight                in [0,1] from Solver::weight_for(); 1 = the active
+//                         filament fully matches the painted target colour
+//   path_nominal_width_mm the width the perimeter generator assigned
+//   config_min/max_mm     texture_mapping_outer_wall_gradient_{min,max}_line_width
+//   global_strength_pct   texture_mapping_outer_wall_gradient_global_strength
+//   layer_height_mm       for the positive-spacing lower bound
+//   nozzle_diameter_mm    for max_surface_offset_mm()
+WallModulation compute_wall_modulation(float         weight,
+                                       float         path_nominal_width_mm,
+                                       float         config_min_width_mm,
+                                       float         config_max_width_mm,
+                                       float         global_strength_pct,
+                                       float         layer_height_mm,
+                                       float         nozzle_diameter_mm,
+                                       OuterWallMode mode);
+
+// Offset a closed ring of points by `delta` (scaled units) using miter joins,
+// preserving the vertex count so the caller can write the result back into the
+// individual ExtrusionPaths that make up the ring.
+//
+// `delta` > 0 moves the ring toward its own interior. Callers wanting "toward
+// the model's material" must negate it for hole loops, whose material is
+// outside the ring.
+//
+// Returns false (leaving `out` untouched) when the ring is degenerate, when
+// the offset would collapse or invert it, or when the arithmetic overflows —
+// in which case the caller must leave the geometry unmodified.
+bool offset_closed_ring(const Points &ring, double delta, Points &out);
 
 } // namespace ImageMapPerLayer
 } // namespace Slic3r

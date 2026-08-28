@@ -37,7 +37,7 @@ index a432007..430387b 100644
      ZLIB::ZLIB
      ${OCCT_LIBS}
 diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
-index ac30594..0110300 100644
+index ac30594..53b8806 100644
 --- a/src/libslic3r/GCode.cpp
 +++ b/src/libslic3r/GCode.cpp
 @@ -1809,6 +1809,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
@@ -51,24 +51,40 @@ index ac30594..0110300 100644
      CNumericLocalesSetter locales_setter;
  
      // Does the file exist? If so, we hope that it is still valid.
-@@ -7090,8 +7094,95 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
+@@ -6173,6 +6177,13 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
+     // get a copy; don't modify the orientation of the original loop object otherwise
+     // next copies (if any) would not detect the correct orientation
+ 
++    // Image-map per-layer color rotation: re-width and offset the whole outer
++    // wall for the layer's active filament, before seam placement and scarf
++    // seam construction build anything from its geometry. `loop` is already a
++    // by-value copy, so this never touches the caller's entity. When the
++    // feature is disabled (default) this returns false without side effects.
++    this->image_map_modulate_outer_wall_loop(loop);
++
+     // extrude all loops ccw or cw according to config
+     if (m_config.print_in_clockwise)
+         bool was_clockwise = loop.make_clockwise();
+@@ -7090,6 +7101,160 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
      return res;
  }
  
--std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
 +// ---------------------------------------------------------------------------
-+// Image-map per-layer color rotation: outer-wall line-width modulation.
++// Image-map per-layer color rotation: outer-wall modulation.
 +// Ported from OrcaSlicer-ImageMap
 +// (https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap, release
 +// v1.0.22, commit 92548381056dbf72836b0a1bdc455f238218dbfb), GCode.cpp outer
-+// wall gradient path (ModulationLineWidth mode, lines ~11027-11360 of origin)
-+// and TextureMappingOffset.cpp component_weights_for_sample().
++// wall gradient path (lines ~10860-11180 of origin) and
++// TextureMappingOffset.cpp component_weights_for_sample().
 +//
-+// Phase-1 adaptation: the origin samples an image texture per path segment;
-+// here the color target of a painted region is constant (the region's
-+// configured filament color), so the solver weight — and therefore the
-+// modulated width — is constant per path. The per-segment sampling, dithering
-+// and centerline-shift machinery of the origin is Phase 2/3 scope.
++// Adaptation: the origin samples an image texture per path *segment*, so it
++// displaces each segment's endpoints individually inside its G-code emission
++// loop. Here the colour target of a painted region is constant, so the solver
++// weight — and therefore both the modulated width and the centerline shift —
++// is constant along a whole external perimeter loop. That lets the shift be
++// applied once, as a miter offset of the closed loop, before seam placement
++// and scarf-seam construction ever see the geometry. Per-segment image
++// sampling, dithering and halftoning remain Phase 3 scope.
 +// ---------------------------------------------------------------------------
 +
 +void GCode::init_image_map_per_layer_color(const Print &print)
@@ -76,12 +92,13 @@ index ac30594..0110300 100644
 +    m_image_map_modulation_enabled = false;
 +    if (!ImageMapPerLayer::enabled(print.config()))
 +        return; // default OFF — strict no-op
-+    // Mirror the guards of ToolOrdering::resolve_image_map_per_layer_filaments()
-+    // so modulation is active exactly when tool-change collapsing is.
-+    const auto &is_mixed = print.config().filament_is_mixed.values;
-+    if (std::any_of(is_mixed.begin(), is_mixed.end(), [](unsigned char v) { return v != 0; }))
-+        return;
-+    const std::vector<unsigned int> rotation = ImageMapPerLayer::rotation_filaments(print);
++    // Read the rotation set ToolOrdering already computed (Print::process()
++    // runs before do_export(), so print.tool_ordering() is populated by now)
++    // instead of independently recomputing it here: ToolOrdering derives the
++    // set from real per-layer extruder usage, not just Print-level config, so
++    // recomputing separately risked silently disagreeing with (or being more
++    // permissive than) the tool-change collapsing this modulation must track.
++    const std::vector<unsigned int> &rotation = print.tool_ordering().image_map_rotation_filaments();
 +    if (rotation.size() < 2)
 +        return;
 +    if (!m_image_map_solver.init(print.config(), rotation))
@@ -89,20 +106,51 @@ index ac30594..0110300 100644
 +    m_image_map_modulation_enabled = true;
 +}
 +
-+bool GCode::image_map_apply_outer_wall_modulation(const ExtrusionPath &path, ExtrusionPath &out)
++bool GCode::image_map_modulate_outer_wall_loop(ExtrusionLoop &loop)
 +{
 +    if (!m_image_map_modulation_enabled)
++        return false; // default OFF — strict no-op
++    if (loop.role() != erExternalPerimeter)
 +        return false;
-+    if (path.role() != erExternalPerimeter)
++    if (loop.paths.empty() || m_writer.filament() == nullptr)
 +        return false;
-+    // A sloped path (scarf seam / spiral transitions) would lose its slope
-+    // data when copied into a plain ExtrusionPath — leave it untouched.
-+    if (dynamic_cast<const ExtrusionPathSloped *>(&path) != nullptr)
++    // Overhang paths inside an external loop are bridged/unsupported material
++    // with their own flow and speed handling. They would have to move with the
++    // rest of the ring to keep it connected, but re-widthing them is not safe,
++    // and shifting them without re-widthing would push them into the wall
++    // behind. Leave such loops entirely alone.
++    if (loop.has_overhang_paths())
 +        return false;
-+    if (path.is_force_no_extrusion() || path.polyline.points.size() < 2)
++    for (const ExtrusionPath &path : loop.paths) {
++        if (path.role() != erExternalPerimeter || path.is_force_no_extrusion())
++            return false;
++        if (path.polyline.points.size() < 2)
++            return false;
++    }
++    // The ring must actually close for the flatten/offset/write-back below to
++    // preserve connectivity.
++    {
++        const Point &ring_end   = loop.paths.back().last_point();
++        const Point &ring_start = loop.paths.front().first_point();
++        if (ring_end.x() != ring_start.x() || ring_end.y() != ring_start.y())
++            return false;
++    }
++    // Likewise every interior junction must be exact, or writing the offset
++    // vertices back would tear the ring apart.
++    for (size_t p = 0; p + 1 < loop.paths.size(); ++p) {
++        const Point &a = loop.paths[p].last_point();
++        const Point &b = loop.paths[p + 1].first_point();
++        if (a.x() != b.x() || a.y() != b.y())
++            return false;
++    }
++    // A single width for the whole ring keeps the centerline shift constant,
++    // which is what makes the one-shot miter offset valid.
++    const float nominal_width = loop.paths.front().width;
++    if (nominal_width <= EPSILON)
 +        return false;
-+    if (m_writer.filament() == nullptr)
-+        return false;
++    for (const ExtrusionPath &path : loop.paths)
++        if (std::abs(path.width - nominal_width) > 1e-4f)
++            return false;
 +
 +    // extrude_perimeters() applies the region config into m_config before
 +    // extruding, so wall_filament here is the painted region's original
@@ -115,41 +163,71 @@ index ac30594..0110300 100644
 +    if (weight < 0.f)
 +        return false; // active or target filament outside the rotation set
 +
-+    const float layer_height = path.height > EPSILON ? path.height :
++    const float layer_height = loop.paths.front().height > EPSILON ? loop.paths.front().height :
 +        float(m_layer != nullptr ? m_layer->height : m_last_height);
-+    const float base_width = std::max(0.01f, path.width);
-+    const float new_width = ImageMapPerLayer::modulated_outer_wall_width(
++    const float nozzle_diameter = float(EXTRUDER_CONFIG(nozzle_diameter));
++    const auto mode = m_config.image_map_outer_wall_mode.value == 1 ?
++        ImageMapPerLayer::OuterWallMode::Centered :
++        ImageMapPerLayer::OuterWallMode::Inward;
++
++    const ImageMapPerLayer::WallModulation modulation = ImageMapPerLayer::compute_wall_modulation(
 +        weight,
-+        base_width,
++        nominal_width,
 +        float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
 +        float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value),
 +        float(m_config.texture_mapping_outer_wall_gradient_global_strength.value),
-+        layer_height);
-+    if (std::abs(new_width - base_width) <= 1e-4f)
++        layer_height,
++        nozzle_diameter,
++        mode);
++    if (!modulation.active)
 +        return false;
 +
-+    out = path;
-+    out.width = new_width;
-+    out.mm3_per_mm = path.mm3_per_mm *
-+        ImageMapPerLayer::flow_scale_for_width_change(base_width, new_width, layer_height);
++    // Flatten the loop into one ring of vertices. Consecutive paths share an
++    // endpoint, so each path contributes all but its last point; the last path's
++    // last point is the first path's first point.
++    Points ring;
++    std::vector<size_t> path_start;
++    path_start.reserve(loop.paths.size());
++    for (const ExtrusionPath &path : loop.paths) {
++        path_start.emplace_back(ring.size());
++        const Points &pts = path.polyline.points;
++        ring.insert(ring.end(), pts.begin(), pts.end() - 1);
++    }
++    if (ring.size() < 3)
++        return false;
++
++    // ImageMapPerLayer::offset_closed_ring() offsets toward the ring's own
++    // interior. For a hole the model's material is *outside* the ring, so the
++    // "toward the material" shift has to be negated.
++    const bool is_hole = (loop.loop_role() & elrPerimeterHole) != 0;
++    double delta = scale_(double(modulation.centerline_shift_mm));
++    if (is_hole)
++        delta = -delta;
++
++    Points offset_ring;
++    if (!ImageMapPerLayer::offset_closed_ring(ring, delta, offset_ring))
++        return false; // degenerate/self-intersecting: leave the loop untouched
++    if (offset_ring.size() != ring.size())
++        return false;
++
++    // Write the offset vertices back, keeping every path's point count and the
++    // shared endpoints consistent.
++    const size_t n = ring.size();
++    for (size_t p = 0; p < loop.paths.size(); ++p) {
++        Points &pts = loop.paths[p].polyline.points;
++        for (size_t i = 0; i < pts.size(); ++i)
++            pts[i] = offset_ring[(path_start[p] + i) % n];
++        loop.paths[p].width = modulation.width_mm;
++        loop.paths[p].mm3_per_mm *= modulation.flow_scale;
++    }
 +    return true;
 +}
 +
-+std::string GCode::_extrude(const ExtrusionPath &path_in, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
+ std::string GCode::_extrude(const ExtrusionPath &path, std::string description, double speed, bool use_seperate_speed, bool is_first_slope)
  {
-+    // Image-map per-layer color rotation: optionally re-width the external
-+    // perimeter for the layer's active filament. When the feature is disabled
-+    // (default) image_map_apply_outer_wall_modulation() returns false without
-+    // side effects and `path` aliases `path_in` unchanged.
-+    ExtrusionPath image_map_modulated_path;
-+    const ExtrusionPath &path = this->image_map_apply_outer_wall_modulation(path_in, image_map_modulated_path) ?
-+        image_map_modulated_path : path_in;
-+
      std::string gcode;
- 
-     if (is_bridge(path.role()))
 diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
-index 5d20282..47f483f 100644
+index 5d20282..be06f23 100644
 --- a/src/libslic3r/GCode.hpp
 +++ b/src/libslic3r/GCode.hpp
 @@ -20,6 +20,7 @@
@@ -170,7 +248,7 @@ index 5d20282..47f483f 100644
      unsigned int m_toolchange_count;
      std::vector<unsigned int> m_filament_change_sequence;
      std::vector<unsigned int> m_nozzle_change_sequence;
-@@ -674,6 +678,13 @@ private:
+@@ -674,6 +678,17 @@ private:
  
      double calc_max_volumetric_speed(const double layer_height, const double line_width, const std::string co_str);
      std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1, bool set_holes_and_compensation_speed = false, bool is_first_slope = false);
@@ -178,14 +256,18 @@ index 5d20282..47f483f 100644
 +    // initialize per-print modulation state; strict no-op when the
 +    // image_map_per_layer_color_rotation toggle (default off) is disabled.
 +    void init_image_map_per_layer_color(const Print &print);
-+    // Returns true and fills `out` when `path` is an external perimeter whose
-+    // width must be modulated for the current layer's active filament.
-+    bool image_map_apply_outer_wall_modulation(const ExtrusionPath &path, ExtrusionPath &out);
++    // Re-widths an external perimeter loop for the current layer's active
++    // filament and offsets its centerline so the wall's outer surface moves to
++    // the colour-correct position, keeping the inner edge where the perimeter
++    // generator put it. Modifies `loop` in place and returns true only when it
++    // did; returns false without side effects when the feature is off or the
++    // loop is not a candidate.
++    bool image_map_modulate_outer_wall_loop(ExtrusionLoop &loop);
      ExtrusionPaths set_speed_transition(std::vector<ExtrusionPaths> &paths);
      void split_and_mapping_speed(double other_path_v, double final_v, ExtrusionPaths &this_path, double max_smooth_length, ExtrusionPaths &interpolated_paths, bool split_from_left = true);
      bool is_enable_overhang_speed();
 diff --git a/src/libslic3r/GCode/ToolOrdering.cpp b/src/libslic3r/GCode/ToolOrdering.cpp
-index 9d429b0..1d85c9c 100644
+index 9d429b0..4152af4 100644
 --- a/src/libslic3r/GCode/ToolOrdering.cpp
 +++ b/src/libslic3r/GCode/ToolOrdering.cpp
 @@ -10,6 +10,7 @@
@@ -246,7 +328,7 @@ index 9d429b0..1d85c9c 100644
      reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
      this->enforce_mixed_component_order();
      m_sorted = true;
-@@ -2625,6 +2628,76 @@ void ToolOrdering::resolve_mixed_filaments(const PrintConfig &config)
+@@ -2625,6 +2628,116 @@ void ToolOrdering::resolve_mixed_filaments(const PrintConfig &config)
      }
  }
  
@@ -277,19 +359,59 @@ index 9d429b0..1d85c9c 100644
 +        return;
 +    if (m_print == nullptr)
 +        return;
-+    // Conservative: never combine with the mixed-filament (virtual slot)
-+    // feature — the two per-layer remaps would interact in untested ways.
-+    if (has_any_mixed_filament(config.filament_is_mixed.values))
++    const size_t num_filaments = config.filament_colour.values.size();
++    if (num_filaments < 2)
 +        return;
 +
-+    const std::vector<unsigned int> rotation = ImageMapPerLayer::rotation_filaments(*m_print);
++    // Filaments used for support anywhere in the print are protected: they
++    // are never rotated so the existing support tool-change behavior
++    // (including on multi-extruder / H2C machines) is left completely
++    // untouched. Mirrors ImageMapPerLayer::rotation_filaments()'s support
++    // exclusion.
++    std::set<unsigned int> protected_filaments;
++    for (const PrintObject *object : m_print->objects()) {
++        const int support = object->config().support_filament.value;
++        if (support > 0 && size_t(support) <= num_filaments)
++            protected_filaments.insert(unsigned(support - 1));
++        const int support_interface = object->config().support_interface_filament.value;
++        if (support_interface > 0 && size_t(support_interface) <= num_filaments)
++            protected_filaments.insert(unsigned(support_interface - 1));
++    }
++
++    // Derive the rotation set directly from what layers actually extrude
++    // (m_layer_tools[*].extruders, already populated and 0-based at this
++    // point) rather than from Print-level config/region/volume-paint
++    // heuristics: those were found to disagree with reality in both
++    // directions on real projects -- enumerating every declared filament
++    // *slot* over-includes ones that are configured but never used (e.g. an
++    // unrelated virtual/mixed AMS slot elsewhere in the project), while
++    // deriving from ModelVolume::get_extruders() paint data can under-include
++    // a color that's genuinely extruded on every single layer. m_layer_tools
++    // is the ground truth: it's literally what feeds the resulting G-code.
++    std::set<unsigned int> rotation_set;
++    for (const LayerTools &lt : m_layer_tools)
++        for (unsigned int ext : lt.extruders)
++            if (protected_filaments.count(ext) == 0)
++                rotation_set.insert(ext);
++
++    const std::vector<unsigned int> rotation(rotation_set.begin(), rotation_set.end());
 +    if (rotation.size() < 2)
 +        return;
++    // Conservative: never combine with the mixed-filament (virtual slot)
++    // feature for filaments that are actually part of the rotation set — the
++    // two per-layer remaps would interact in untested ways. A virtual/mixed
++    // slot elsewhere in the project's filament list that this print doesn't
++    // actually use must not disable the feature project-wide (config.filament_is_mixed
++    // covers every configured filament slot, not just the ones in rotation).
++    const std::vector<unsigned char> &is_mixed = config.filament_is_mixed.values;
++    for (unsigned int filament : rotation)
++        if (filament < is_mixed.size() && is_mixed[filament])
++            return;
++
 +    const std::vector<unsigned int> sequence = ImageMapPerLayer::rotation_sequence(rotation);
 +    if (sequence.empty())
 +        return;
 +
-+    const std::set<unsigned int> rotation_set(rotation.begin(), rotation.end());
 +    for (LayerTools &lt : m_layer_tools) {
 +        const size_t layer_idx = size_t(&lt - m_layer_tools.data());
 +        const unsigned int active = ImageMapPerLayer::active_filament_for_layer(sequence, int(layer_idx));
@@ -381,10 +503,10 @@ index 8735207..43f9d60 100644
      // Used by gradient run detection to distinguish real gaps (object has a layer
      // that doesn't use the slot) from spurious gaps (another object's layer).
 diff --git a/src/libslic3r/Preset.cpp b/src/libslic3r/Preset.cpp
-index 632b750..4e0d57b 100644
+index 632b750..a6e382c 100644
 --- a/src/libslic3r/Preset.cpp
 +++ b/src/libslic3r/Preset.cpp
-@@ -1059,6 +1059,10 @@ static std::vector<std::string> s_Preset_print_options {
+@@ -1059,6 +1059,11 @@ static std::vector<std::string> s_Preset_print_options {
      "prime_tower_flat_ironing","enable_circle_compensation", "circle_compensation_manual_offset", "apply_scarf_seam_on_circles",
      "wipe_tower_no_sparse_layers", "compatible_printers", "compatible_printers_condition", "inherits",
      "flush_into_infill", "flush_into_objects", "flush_into_support","process_notes", "enable_mixed_color_sublayer",
@@ -392,14 +514,15 @@ index 632b750..4e0d57b 100644
 +    "image_map_per_layer_color_rotation", "texture_mapping_outer_wall_gradient_global_strength",
 +    "texture_mapping_outer_wall_gradient_max_line_width", "texture_mapping_outer_wall_gradient_min_line_width",
 +    "image_map_generic_solver_lookup_mode", "image_map_generic_solver_mode", "image_map_generic_solver_mix_model",
++    "image_map_outer_wall_mode",
      // BBS
       "tree_support_branch_angle", "tree_support_wall_count", "tree_support_branch_distance", "tree_support_branch_diameter",
      "tree_support_branch_diameter_angle",
 diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
-index 7d8ab09..49c7ab4 100644
+index 7d8ab09..3d08cae 100644
 --- a/src/libslic3r/PrintConfig.cpp
 +++ b/src/libslic3r/PrintConfig.cpp
-@@ -6050,6 +6050,79 @@ void PrintConfigDef::init_fff_params()
+@@ -6050,6 +6050,97 @@ void PrintConfigDef::init_fff_params()
      def->mode = comSimple;
      def->set_default_value(new ConfigOptionBool(false));
  
@@ -476,14 +599,32 @@ index 7d8ab09..49c7ab4 100644
 +    def->mode = comDevelop;
 +    def->set_default_value(new ConfigOptionInt(0));
 +
++    // Phase 2: how far, and in which direction, the modulated outer wall's
++    // surface is allowed to move from where the perimeter generator put it.
++    // Both modes keep the wall's inner edge fixed, so neither can over-extrude
++    // into the wall behind it.
++    def = this->add("image_map_outer_wall_mode", coInt);
++    def->label = L("Image-map outer wall mode");
++    def->tooltip = L("How the outer wall's surface moves to approximate the painted color. "
++                     "0: inward only - the wall only narrows, so the surface recedes into the "
++                     "model and outer dimensions never grow (ported from OrcaSlicer-ImageMap's "
++                     "offset gradient mode). 1: centered - the wall may also widen past its "
++                     "nominal width, so the surface swings both outward and inward around its "
++                     "nominal position, roughly doubling the color range. Surface movement is "
++                     "capped at the nozzle diameter (max 0.35 mm) either way.");
++    def->min = 0;
++    def->max = 1;
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionInt(0));
++
      def = this->add("enable_prime_tower", coBool);
      def->label = L("Enable");
      def->tooltip = L("The wiping tower can be used to clean up the residue on the nozzle and stabilize the chamber pressure inside the nozzle, "
 diff --git a/src/libslic3r/PrintConfig.hpp b/src/libslic3r/PrintConfig.hpp
-index 0f1319c..89e2b87 100644
+index 0f1319c..74969a7 100644
 --- a/src/libslic3r/PrintConfig.hpp
 +++ b/src/libslic3r/PrintConfig.hpp
-@@ -1514,6 +1514,14 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
+@@ -1514,6 +1514,15 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
      ((ConfigOptionInts,               nozzle_temperature_range_high))
      ((ConfigOptionFloatsNullable,     wipe_distance))
      ((ConfigOptionBool,               enable_mixed_color_sublayer))
@@ -495,6 +636,7 @@ index 0f1319c..89e2b87 100644
 +    ((ConfigOptionInt,                image_map_generic_solver_lookup_mode))
 +    ((ConfigOptionInt,                image_map_generic_solver_mode))
 +    ((ConfigOptionInt,                image_map_generic_solver_mix_model))
++    ((ConfigOptionInt,                image_map_outer_wall_mode))
      ((ConfigOptionBool,               enable_prime_tower))
      ((ConfigOptionBool,               prime_tower_enable_framework))
      // BBS: change wipe_tower_x and wipe_tower_y data type to floats to add partplate logic

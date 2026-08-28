@@ -19,6 +19,8 @@
 #include <numeric>
 #include <set>
 
+#include <boost/log/trivial.hpp>
+
 namespace Slic3r {
 namespace ImageMapPerLayer {
 
@@ -126,18 +128,19 @@ std::vector<unsigned int> rotation_filaments(const Print &print)
             protected_filaments.insert(unsigned(support_interface - 1));
     }
 
+    // print.num_print_regions() enumerates one PrintRegionConfig per filament
+    // slot *declared in the project's configuration*, regardless of whether
+    // that slot is actually painted onto (or assigned to) this object's
+    // geometry — Bambu Studio pre-creates a region per configured filament
+    // slot. object_extruders() instead derives the truly-used set from each
+    // volume's real MMU-paint / per-part filament data (ModelVolume::get_extruders()),
+    // so it correctly excludes filament slots that exist in the project but
+    // were never actually extruded (e.g. unrelated virtual/mixed slots, or
+    // AMS colors simply not used on this plate).
     std::set<unsigned int> rotation;
-    auto add_filament = [&](int filament_1based) {
-        if (filament_1based > 0 && size_t(filament_1based) <= num_filaments &&
-            protected_filaments.count(unsigned(filament_1based - 1)) == 0)
-            rotation.insert(unsigned(filament_1based - 1));
-    };
-    for (size_t region_idx = 0; region_idx < print.num_print_regions(); ++region_idx) {
-        const PrintRegionConfig &region_config = print.get_print_region(region_idx).config();
-        add_filament(region_config.wall_filament.value);
-        add_filament(region_config.solid_infill_filament.value);
-        add_filament(region_config.sparse_infill_filament.value);
-    }
+    for (unsigned int filament : print.object_extruders())
+        if (filament < num_filaments && protected_filaments.count(filament) == 0)
+            rotation.insert(filament);
 
     return std::vector<unsigned int>(rotation.begin(), rotation.end());
 }
@@ -291,6 +294,230 @@ double flow_scale_for_width_change(float old_width_mm, float new_width_mm, float
     if (!(old_area > 0.) || !(new_area > 0.))
         return 1.;
     return new_area / old_area;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: outer-wall surface offsetting. See ImageMapPerLayerColor.hpp for the
+// design note and the one deliberate deviation from the origin.
+// ---------------------------------------------------------------------------
+
+// Port of TextureMappingManager::max_component_surface_offset_mm()
+// (origin TextureMapping.cpp:2219).
+float max_surface_offset_mm(float nozzle_diameter_mm)
+{
+    const float safe_reference = std::max(0.05f, std::abs(nozzle_diameter_mm));
+    return std::clamp(safe_reference, 0.01f, 0.35f);
+}
+
+WallModulation compute_wall_modulation(float         weight,
+                                       float         path_nominal_width_mm,
+                                       float         config_min_width_mm,
+                                       float         config_max_width_mm,
+                                       float         global_strength_pct,
+                                       float         layer_height_mm,
+                                       float         nozzle_diameter_mm,
+                                       OuterWallMode mode)
+{
+    WallModulation out;
+
+    const float nominal = std::max(0.01f, path_nominal_width_mm);
+    const float layer_height = std::max(0.01f, layer_height_mm);
+    const float strength = std::clamp(global_strength_pct / 100.f, 0.f, 1.f);
+    const float cap = max_surface_offset_mm(nozzle_diameter_mm);
+
+    // Lower bound on the width: the configured minimum, but never below the
+    // width at which the rounded-rectangle cross-section's spacing turns
+    // negative. Ported verbatim from origin GCode.cpp:10967
+    // (min_width_for_positive_spacing_mm).
+    const float min_width_for_positive_spacing = layer_height * float(1. - 0.25 * M_PI) + 1e-4f;
+    const float hard_min = std::max(0.05f, min_width_for_positive_spacing);
+
+    // The width sweep [lo, hi]. Both ends are clamped so the resulting surface
+    // never moves further than `cap` from nominal, mirroring the origin's
+    // max_width_delta_limit_mm = min(effective_delta, 2 * max_allowed_distance)
+    // (origin GCode.cpp:11026) -- there the delta is one-sided about the base
+    // width, here it is two-sided about the nominal width.
+    float lo = std::max({config_min_width_mm, hard_min, nominal - cap});
+    float hi = nominal;
+    if (mode == OuterWallMode::Centered) {
+        // Widening is what buys the outward half of the swing. Cap it both by
+        // the user's configured maximum and by the surface-offset cap.
+        hi = std::clamp(config_max_width_mm, nominal, nominal + cap);
+    } else {
+        // Inward mode still honours the configured maximum as an absolute
+        // upper bound (origin GCode.cpp:11116 applies it the same way).
+        hi = std::min(nominal, std::max(0.05f, config_max_width_mm));
+    }
+    lo = std::min(lo, hi);
+
+    // weight 1 -> widest (the active filament matches the painted colour, so
+    // deposit the full line); weight 0 -> narrowest.
+    const float w = std::clamp(weight, 0.f, 1.f);
+    const float raw_width = lo + w * (hi - lo);
+    // The global strength scales the whole swing about the nominal width, so
+    // strength 0 is an exact no-op in both modes.
+    // Scaling about the nominal width keeps `width` inside [lo, hi] on its own;
+    // the floor is a belt-and-braces guard on the positive-spacing bound.
+    float width = std::max(nominal + (raw_width - nominal) * strength, std::min(hard_min, nominal));
+    if (!std::isfinite(width) || width <= 0.f)
+        return out;
+
+    // Pin the wall's inner edge: shifting the centerline by half the width
+    // change keeps (centerline - width/2) constant, so the surface moves by
+    // exactly (width - nominal) and the wall behind this one is never
+    // encroached on. Positive shift = toward the material = surface recedes.
+    const float shift = 0.5f * (nominal - width);
+    const float surface_offset = width - nominal;
+    if (!std::isfinite(shift) || std::abs(surface_offset) > cap + 1e-4f)
+        return out;
+
+    out.width_mm = width;
+    out.centerline_shift_mm = shift;
+    out.surface_offset_mm = surface_offset;
+    out.flow_scale = flow_scale_for_width_change(nominal, width, layer_height);
+    if (!std::isfinite(out.flow_scale) || out.flow_scale <= 0.)
+        return WallModulation{};
+    // Below ~1 um of surface movement there is nothing worth perturbing the
+    // toolpath for.
+    out.active = std::abs(surface_offset) > 1e-3f;
+    return out;
+}
+
+bool offset_closed_ring(const Points &ring, double delta, Points &out)
+{
+    const size_t n = ring.size();
+    if (n < 3 || !std::isfinite(delta))
+        return false;
+    if (std::abs(delta) <= SCALED_EPSILON)
+        return false;
+
+    // Signed area (twice) via the shoelace formula, in doubles: coordinates are
+    // scaled int64 and their products overflow 32-bit arithmetic easily.
+    auto signed_area2 = [](const Points &pts) {
+        double acc = 0.;
+        for (size_t i = 0, m = pts.size(); i < m; ++i) {
+            const Point &a = pts[i];
+            const Point &b = pts[(i + 1) % m];
+            acc += double(a.x()) * double(b.y()) - double(b.x()) * double(a.y());
+        }
+        return acc;
+    };
+
+    const double area2 = signed_area2(ring);
+    if (!std::isfinite(area2) || std::abs(area2) <= EPSILON)
+        return false;
+    // For a CCW ring (positive area) the interior lies to the left of every
+    // directed edge, i.e. along (-dy, dx).
+    const double orientation = area2 > 0. ? 1. : -1.;
+
+    // Unit interior normal of the edge leaving vertex i.
+    std::vector<double> nx(n, 0.), ny(n, 0.);
+    std::vector<bool>   have_normal(n, false);
+    for (size_t i = 0; i < n; ++i) {
+        const Point &a = ring[i];
+        const Point &b = ring[(i + 1) % n];
+        const double dx = double(b.x()) - double(a.x());
+        const double dy = double(b.y()) - double(a.y());
+        const double len = std::hypot(dx, dy);
+        if (len <= EPSILON)
+            continue; // zero-length edge (duplicate point): filled in below
+        nx[i] = orientation * (-dy / len);
+        ny[i] = orientation * (dx / len);
+        have_normal[i] = true;
+    }
+    // Duplicate points carry no direction of their own; give them the nearest
+    // preceding real edge's normal so the miter below stays well-defined. The
+    // ring has at least one real edge, or its area would have been zero.
+    {
+        size_t last = n;
+        for (size_t pass = 0; pass < 2; ++pass)
+            for (size_t i = 0; i < n; ++i) {
+                if (have_normal[i]) {
+                    last = i;
+                } else if (last < n) {
+                    nx[i] = nx[last];
+                    ny[i] = ny[last];
+                    have_normal[i] = true;
+                }
+            }
+        if (std::find(have_normal.begin(), have_normal.end(), false) != have_normal.end())
+            return false;
+    }
+
+    // A miter join can run away at a near-reversal corner; the origin clamps
+    // its per-segment shift too (clamped_shift_coord_for_gcode, bounded by
+    // scale_(max(0.5, base_outer_width))). Cap the displacement at 4x the
+    // requested offset, which leaves ordinary corners exact.
+    const double max_displacement = 4. * std::abs(delta);
+
+    Points offset;
+    offset.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        // Vertex i joins the edge arriving from i-1 and the edge leaving i.
+        const size_t prev = (i + n - 1) % n;
+        const double pnx = nx[prev], pny = ny[prev];
+        const double cnx = nx[i], cny = ny[i];
+        const double denom = 1. + (pnx * cnx + pny * cny);
+
+        double vx, vy;
+        if (denom <= 1e-6) {
+            // Corner folds back on itself; the miter point is at infinity. Fall
+            // back to the (bevel-like) average normal.
+            const double ax = pnx + cnx;
+            const double ay = pny + cny;
+            const double len = std::hypot(ax, ay);
+            if (len <= EPSILON) {
+                vx = delta * cnx;
+                vy = delta * cny;
+            } else {
+                vx = delta * ax / len;
+                vy = delta * ay / len;
+            }
+        } else {
+            vx = delta * (pnx + cnx) / denom;
+            vy = delta * (pny + cny) / denom;
+        }
+
+        const double displacement = std::hypot(vx, vy);
+        if (!std::isfinite(displacement))
+            return false;
+        if (displacement > max_displacement && displacement > EPSILON) {
+            const double s = max_displacement / displacement;
+            vx *= s;
+            vy *= s;
+        }
+
+        const double x = double(ring[i].x()) + vx;
+        const double y = double(ring[i].y()) + vy;
+        if (!std::isfinite(x) || !std::isfinite(y) ||
+            std::abs(x) > double(std::numeric_limits<coord_t>::max()) ||
+            std::abs(y) > double(std::numeric_limits<coord_t>::max()))
+            return false;
+        offset.emplace_back(coord_t(std::llround(x)), coord_t(std::llround(y)));
+    }
+
+    // Reject the offset if it overran the feature. Leaving the geometry alone
+    // is always a safe outcome for the caller.
+    const double offset_area2 = signed_area2(offset);
+    if (!std::isfinite(offset_area2))
+        return false;
+    // The winding must survive.
+    if (offset_area2 * area2 <= 0.)
+        return false;
+    // An inward offset has to shrink the ring, an outward one has to grow it.
+    // The winding check above is NOT sufficient on its own: mitering a square
+    // narrower than twice the offset inward turns it inside out but re-emerges
+    // as a *larger* square of the same winding, which passes a sign test.
+    const double area_before = std::abs(area2);
+    const double area_after  = std::abs(offset_area2);
+    if (delta > 0. ? area_after >= area_before : area_after <= area_before)
+        return false;
+    // ...and an inward offset must leave something behind.
+    if (delta > 0. && area_after < 0.1 * area_before)
+        return false;
+
+    out = std::move(offset);
+    return true;
 }
 
 } // namespace ImageMapPerLayer

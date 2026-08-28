@@ -3,7 +3,7 @@
 This directory contains third-party/ported libraries vendored from
 [OrcaSlicer-ImageMap](https://github.com/sentientstardust-dev/OrcaSlicer-ImageMap)
 (release v1.0.22, commit `92548381056dbf72836b0a1bdc455f238218dbfb`) to support
-the *image-map per-layer color rotation* feature (Phase 1 port).
+the *image-map per-layer color rotation* feature (Phase 1 + Phase 2 port).
 
 They are deliberately kept separate from Bambu Studio core code.
 
