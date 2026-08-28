@@ -118,8 +118,17 @@ log "Configuring BambuStudio"
 mkdir -p "$SRC_DIR/build"
 (
   cd "$SRC_DIR/build"
+  # SLIC3R_BUILD_TESTS is pinned OFF rather than left to its default: this
+  # script reuses $SRC_DIR and its CMake cache across runs, so a developer who
+  # had previously configured that tree with -DSLIC3R_BUILD_TESTS=ON (e.g. to
+  # run imagemap_tests) would otherwise carry the cached ON into this build,
+  # and `--target install` would then try to build the upstream test suites.
+  # Several of those no longer compile against 02.08.02.61 (libnest2d_tests,
+  # libslic3r_tests and fff_print_tests all reference APIs that have since
+  # changed), which fails the DMG build for reasons entirely unrelated to it.
   cmake .. \
     -DBBL_RELEASE_TO_PUBLIC=1 \
+    -DSLIC3R_BUILD_TESTS=OFF \
     -DCMAKE_PREFIX_PATH="$DEPS_DIR/usr/local" \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
