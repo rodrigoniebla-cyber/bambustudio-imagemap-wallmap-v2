@@ -591,7 +591,7 @@ index 632b750..b1cf220 100644
       "tree_support_branch_angle", "tree_support_wall_count", "tree_support_branch_distance", "tree_support_branch_diameter",
      "tree_support_branch_diameter_angle",
 diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
-index 7d8ab09..07a567b 100644
+index 7d8ab09..430501a 100644
 --- a/src/libslic3r/PrintConfig.cpp
 +++ b/src/libslic3r/PrintConfig.cpp
 @@ -209,6 +209,13 @@ static t_config_enum_values s_keys_map_NoiseType {
@@ -608,7 +608,7 @@ index 7d8ab09..07a567b 100644
  static t_config_enum_values s_keys_map_FuzzySkinMode {
      { "displacement", int(FuzzySkinMode::Displacement) },
      { "extrusion",    int(FuzzySkinMode::Extrusion) },
-@@ -6050,6 +6057,184 @@ void PrintConfigDef::init_fff_params()
+@@ -6050,6 +6057,197 @@ void PrintConfigDef::init_fff_params()
      def->mode = comSimple;
      def->set_default_value(new ConfigOptionBool(false));
  
@@ -677,12 +677,16 @@ index 7d8ab09..07a567b 100644
 +    def->tooltip = L("Upper bound for the modulated external perimeter width. Only has an effect "
 +                     "above the nominal width when 'Allow the wall to widen' is on, and the "
 +                     "resulting surface movement is capped at the nozzle diameter (max 0.35 mm) "
-+                     "regardless. Only used when 'Vary outer wall line width' is on.");
++                     "regardless.\n"
++                     "Set 0 for automatic: the wall's own width plus the surface travel cap, which "
++                     "keeps the same proportions on any nozzle. A fixed millimetre value that "
++                     "suits a 0.4 mm nozzle does not suit a 0.2 mm one, whose walls are 0.22 mm.\n"
++                     "Only used when 'Vary outer wall line width' is on.");
 +    def->sidetext = "mm";
-+    def->min = 0.05;
++    def->min = 0;
 +    def->max = 3.0;
 +    def->mode = comDevelop;
-+    def->set_default_value(new ConfigOptionFloat(0.95));
++    def->set_default_value(new ConfigOptionFloat(0));
 +
 +    def = this->add("texture_mapping_outer_wall_gradient_min_line_width", coFloat);
 +    def->label = L("Minimum outer wall line width");
@@ -690,12 +694,17 @@ index 7d8ab09..07a567b 100644
 +    def->tooltip = L("Lower bound for the modulated external perimeter width. Values below what "
 +                     "the nozzle can actually extrude (half the nozzle diameter) are raised to "
 +                     "that floor: asking for lines thinner than that does not produce a thinner "
-+                     "wall, it produces gaps. Only used when 'Vary outer wall line width' is on.");
++                     "wall, it produces gaps.\n"
++                     "Set 0 for automatic: the wall's own width minus the surface travel cap, "
++                     "floored at what the nozzle can extrude. A fixed millimetre value that suits "
++                     "a 0.4 mm nozzle does not suit a 0.2 mm one - 0.32 mm is wider than that "
++                     "machine's 0.22 mm wall, which leaves nothing to modulate at all.\n"
++                     "Only used when 'Vary outer wall line width' is on.");
 +    def->sidetext = "mm";
-+    def->min = 0.05;
++    def->min = 0;
 +    def->max = 2.0;
 +    def->mode = comDevelop;
-+    def->set_default_value(new ConfigOptionFloat(0.32));
++    def->set_default_value(new ConfigOptionFloat(0));
 +
 +    // Generic solver configuration (defaults match the OrcaSlicer-ImageMap
 +    // TextureMappingZone defaults; 255 = "slicer default" sentinel resolving to
@@ -744,13 +753,17 @@ index 7d8ab09..07a567b 100644
 +    def->label = L("Wall offset distance");
 +    def->category = L("Multimaterial");
 +    def->tooltip = L("Peak distance the outer wall's surface travels. Larger values give a "
-+                     "stronger color effect and a rougher surface. Clamped to the nozzle diameter "
-+                     "(max 0.35 mm). Only used when 'Offset outer wall surface' is on.");
++                     "stronger color effect and a rougher surface. The resulting movement is "
++                     "capped at the nozzle diameter (max 0.35 mm).\n"
++                     "Set 0 for automatic: the full surface travel cap for this nozzle, which "
++                     "'In and out' spends as +/- half of it. Use the toggle above, not a zero "
++                     "distance, to turn this off.\n"
++                     "Only used when 'Offset outer wall surface' is on.");
 +    def->sidetext = "mm";
 +    def->min = 0.0;
-+    def->max = 0.35;
++    def->max = 0.7;
 +    def->mode = comDevelop;
-+    def->set_default_value(new ConfigOptionFloat(0.15));
++    def->set_default_value(new ConfigOptionFloat(0));
 +
 +    def = this->add("image_map_wall_offset_direction", coEnum);
 +    def->label = L("Wall offset direction");
@@ -793,7 +806,7 @@ index 7d8ab09..07a567b 100644
      def = this->add("enable_prime_tower", coBool);
      def->label = L("Enable");
      def->tooltip = L("The wiping tower can be used to clean up the residue on the nozzle and stabilize the chamber pressure inside the nozzle, "
-@@ -7234,7 +7419,16 @@ void PrintConfigDef::init_sla_params()
+@@ -7234,7 +7432,16 @@ void PrintConfigDef::init_sla_params()
  void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &value)
  {
      //BBS: handle legacy options

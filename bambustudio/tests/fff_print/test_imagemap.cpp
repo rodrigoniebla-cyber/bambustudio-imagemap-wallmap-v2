@@ -301,9 +301,22 @@ TEST_CASE("imagemap: zero strength disables the width half without disabling the
     REQUIRE(m.flow_scale == Approx(1.0));
     REQUIRE(m.surface_offset_mm == Approx(-0.5f * 0.15f).margin(1e-4));
 
-    // A zero offset distance is likewise a no-op for the offset half.
+    // A zero offset distance is NOT a no-op: 0 means "derive from the nozzle"
+    // (kAutoFromNozzle), because a fixed millimetre default cannot suit every
+    // nozzle. Turning the offset half off is the toggle's job, not a zero
+    // distance's -- compute_wall_modulation() is never reached with the half
+    // enabled and no effect intended.
+    const float cap = Slic3r::ImageMapPerLayer::max_surface_offset_mm(kNozzle);
+    REQUIRE(offset_only(1.f, Slic3r::ImageMapPerLayer::kAutoFromNozzle, WallOffsetDirection::Both)
+                .surface_offset_mm == Approx(+0.5f * cap).margin(1e-3));
+    REQUIRE(offset_only(0.f, Slic3r::ImageMapPerLayer::kAutoFromNozzle, WallOffsetDirection::Both)
+                .surface_offset_mm == Approx(-0.5f * cap).margin(1e-3));
+
+    // Clearing the toggle is what makes it inert.
+    WallModulationSettings off = base_settings();
+    off.offset_surface = false;
     for (int i = 0; i <= 4; ++i)
-        REQUIRE(!offset_only(float(i) / 4.f, 0.f, WallOffsetDirection::Both).active);
+        REQUIRE(!Slic3r::ImageMapPerLayer::compute_wall_modulation(float(i) / 4.f, kNominal, off).active);
 }
 
 // This is the regression that produced the voids on a real Benchy: the project
@@ -434,6 +447,97 @@ TEST_CASE("imagemap: a re-widthed loop whose ring does not move is still applied
     REQUIRE(m.active);
     REQUIRE(m.width_mm < kNominal - 1e-3f);
     REQUIRE(m.flow_scale < 1.0);
+}
+
+// A 0.2 mm nozzle prints 0.22 mm walls (BBL's fdm_process_single_*_nozzle_0.2
+// profiles), against 0.42 mm on a 0.4 mm nozzle. The wall map's three millimetre
+// settings used to default to fixed values picked for the 0.4: a 0.32 mm minimum
+// line width is *wider* than the whole 0.22 mm wall, which collapsed the sweep to
+// a single point (narrow-only: the toggle did nothing whatsoever) or pinned the
+// wall permanently 45-91% over its nominal width and never let it recede
+// (widening). Auto derives from the nozzle instead.
+TEST_CASE("imagemap: the wall map works on a 0.2 mm nozzle, not just a 0.4", "[ImageMapPerLayerColor]")
+{
+    struct Machine { const char *name; float nozzle; float nominal; float layer; };
+    const Machine machines[] = {
+        { "0.4 mm nozzle", 0.40f, 0.42f, 0.20f },
+        { "0.2 mm nozzle", 0.20f, 0.22f, 0.14f },
+        { "0.6 mm nozzle", 0.60f, 0.62f, 0.30f },
+    };
+
+    for (const Machine &m : machines) {
+        CAPTURE(m.name);
+        const float cap = Slic3r::ImageMapPerLayer::max_surface_offset_mm(m.nozzle);
+        const float floor_mm = Slic3r::ImageMapPerLayer::min_printable_width_mm(m.nozzle);
+
+        WallModulationSettings s;                 // all three mm settings default to auto
+        s.layer_height_mm    = m.layer;
+        s.nozzle_diameter_mm = m.nozzle;
+
+        SECTION(std::string(m.name) + ": the width half actually modulates") {
+            s.modulate_width = true;
+            const WallModulation none = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, m.nominal, s);
+            const WallModulation full = Slic3r::ImageMapPerLayer::compute_wall_modulation(1.f, m.nominal, s);
+            // The regression: on a 0.2 mm nozzle this used to be inactive.
+            REQUIRE(none.active);
+            REQUIRE(none.width_changed);
+            REQUIRE(none.width_mm < m.nominal - 1e-3f);   // it recedes...
+            REQUIRE(none.width_mm >= floor_mm - 1e-4f);   // ...but stays extrudable
+            REQUIRE(!full.active);                        // weight 1 == nominal, nothing to do
+            REQUIRE(std::abs(none.surface_offset_mm) <= cap + 1e-3f);
+        }
+
+        SECTION(std::string(m.name) + ": widening never pins the wall above nominal") {
+            s.modulate_width = true;
+            s.allow_widening = true;
+            // The other 0.2 mm failure: the sweep sat entirely above the nominal
+            // width, so every layer over-extruded and none ever receded.
+            const WallModulation none = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, m.nominal, s);
+            const WallModulation full = Slic3r::ImageMapPerLayer::compute_wall_modulation(1.f, m.nominal, s);
+            REQUIRE(none.width_mm < m.nominal);
+            REQUIRE(full.width_mm > m.nominal);
+            REQUIRE(none.surface_offset_mm < 0.f);
+            REQUIRE(full.surface_offset_mm > 0.f);
+            REQUIRE(none.width_mm >= floor_mm - 1e-4f);
+        }
+
+        SECTION(std::string(m.name) + ": auto offset distance scales to the nozzle") {
+            s.offset_surface = true;              // distance auto == cap, "in and out"
+            const WallModulation full = Slic3r::ImageMapPerLayer::compute_wall_modulation(1.f, m.nominal, s);
+            const WallModulation none = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, m.nominal, s);
+            REQUIRE(full.surface_offset_mm == Approx(+0.5f * cap).margin(1e-3));
+            REQUIRE(none.surface_offset_mm == Approx(-0.5f * cap).margin(1e-3));
+            REQUIRE(!full.width_changed);
+        }
+
+        SECTION(std::string(m.name) + ": the combined preset stays inside the cap") {
+            const WallModulationSettings preset =
+                Slic3r::ImageMapPerLayer::combined_preset_settings(m.nominal, m.layer, m.nozzle);
+            for (int i = 0; i <= 10; ++i) {
+                const WallModulation w =
+                    Slic3r::ImageMapPerLayer::compute_wall_modulation(float(i) / 10.f, m.nominal, preset);
+                REQUIRE(std::abs(w.surface_offset_mm) <= cap + 1e-3f);
+                REQUIRE(w.width_mm >= floor_mm - 1e-4f);
+            }
+        }
+    }
+}
+
+TEST_CASE("imagemap: an explicit millimetre setting still overrides auto", "[ImageMapPerLayerColor]")
+{
+    // Auto is only the default; a user who types a number gets that number.
+    WallModulationSettings s = base_settings();   // explicit 0.32 / 0.95 / 0.15
+    s.modulate_width = true;
+    REQUIRE(Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, kNominal, s).width_mm
+            == Approx(kMinWidth).margin(1e-4));
+
+    WallModulationSettings o;                     // auto everywhere
+    o.layer_height_mm = kLayerHeight;
+    o.nozzle_diameter_mm = kNozzle;
+    o.offset_surface = true;
+    o.offset_distance_mm = 0.15f;                 // explicit
+    REQUIRE(Slic3r::ImageMapPerLayer::compute_wall_modulation(1.f, kNominal, o).surface_offset_mm
+            == Approx(0.075f).margin(1e-4));
 }
 
 TEST_CASE("imagemap: the combined preset runs both halves and beats either alone", "[ImageMapPerLayerColor]")

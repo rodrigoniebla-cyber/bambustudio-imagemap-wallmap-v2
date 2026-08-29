@@ -475,6 +475,54 @@ width floor still applies, so the preset can never request an unextrudable line.
 into three), so such a project loads cleanly and picks up the new defaults —
 surface offsetting on, width modulation off. Re-select the toggles you want.
 
+### Nozzle scaling: 0 means "derive it"
+
+The wall map's three millimetre settings were absolute values picked for a
+0.4 mm nozzle, and they did not survive contact with a 0.2 mm one. BBL's own
+`fdm_process_single_*_nozzle_0.2` profiles print **0.22 mm walls** against
+0.42 mm on a 0.4 mm nozzle, so the 0.32 mm default minimum line width was
+*wider than the entire wall*:
+
+| | sweep on a 0.2 mm nozzle | result |
+|---|---|---|
+| narrow-only | 0.220 … 0.220 | **the toggle did nothing at all** — `lo` clamped up to `hi` |
+| allow widening | 0.320 … 0.420 | wall pinned 45–91% **over** nominal, never receded |
+
+Both are silent: the toggle reports as on and produces either no effect or
+solid over-extrusion. The offset half had a milder version of the same problem —
+a 0.15 mm default is 36% of a 0.4 mm nozzle's wall but 68% of a 0.2 mm one, and
+its 0.35 mm maximum sat above that machine's 0.20 mm cap, so the top of the
+setting's range did nothing.
+
+All three now default to **0 = derive from the nozzle and this path's own
+nominal width** (`kAutoFromNozzle`), the convention Bambu Studio already uses
+for `outer_wall_line_width`, whose 0 means "work it out from `line_width`":
+
+| setting | auto value | 0.4 mm nozzle | 0.2 mm nozzle |
+|---|---|---|---|
+| min line width | `nominal − cap`, floored at `min_printable_width_mm()` | 0.245 mm | 0.10 mm |
+| max line width | `nominal + cap` | 0.595 mm | 0.42 mm |
+| offset distance | `cap` ("in and out" spends ± half) | 0.35 mm | 0.20 mm |
+
+An explicit non-zero value is still taken literally — auto is only the default.
+`image_map_wall_offset_distance`'s maximum was also raised from 0.35 to 0.7,
+since "in and out" spends only half of it and the old ceiling made the top of
+the range unreachable. Note the semantic change: a zero distance no longer means
+"off"; clearing the toggle does.
+
+Verified end to end by re-slicing the Benchy project with `nozzle_diameter`,
+`line_width` and `layer_height` set to a real 0.2 mm nozzle profile's values:
+
+| 0.2 mm nozzle (cap 0.20, wall 0.22, floor 0.10) | line widths | blocks wider than baseline | max outward growth | lines under the floor |
+|---|---|---|---|---|
+| wall map off | 0.088–0.317 | — | — | 6 |
+| width toggle | 0.088–**0.463** | 1789 | 0.153 mm | 6 |
+| combined preset | 0.088–0.363 | 1141 | 0.200 mm (= cap) | 6 |
+
+The width toggle now modulates where it previously produced nothing; nothing
+exceeds that machine's cap; and the 6 sub-floor lines are Arachne thin walls
+present with the feature off, not something the wall map introduces.
+
 ### The miter runaway: loops outside the wall path
 
 `offset_closed_ring()` displaces each vertex along its corner bisector by

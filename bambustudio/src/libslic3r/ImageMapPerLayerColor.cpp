@@ -361,16 +361,26 @@ WallModulation compute_wall_modulation(float                         weight,
         // max_width_delta_limit_mm = min(effective_delta, 2 * max_allowed_distance)
         // (origin GCode.cpp:11026) -- there the delta is one-sided about the
         // base width, here it is two-sided about the nominal width.
-        float lo = std::max({settings.config_min_width_mm, hard_min, nominal - cap});
+        // 0 = derive from the nozzle: the full surface-travel budget either side
+        // of this path's own nominal width. On a 0.4 mm nozzle that reproduces
+        // the old hand-picked millimetre defaults; on a 0.2 mm nozzle (0.22 mm
+        // walls) it gives 0.10..0.42 instead of a literal 0.32 mm minimum, which
+        // exceeds the nominal width and leaves nothing to modulate.
+        const float config_min = settings.config_min_width_mm > 0.f ? settings.config_min_width_mm
+                                                                    : std::max(hard_min, nominal - cap);
+        const float config_max = settings.config_max_width_mm > 0.f ? settings.config_max_width_mm
+                                                                    : nominal + cap;
+
+        float lo = std::max({config_min, hard_min, nominal - cap});
         float hi = nominal;
         if (settings.allow_widening) {
             // Widening is what buys the outward half of the swing. Cap it both
             // by the user's configured maximum and by the surface-offset cap.
-            hi = std::clamp(settings.config_max_width_mm, nominal, nominal + cap);
+            hi = std::clamp(config_max, nominal, nominal + cap);
         } else {
             // Narrow-only still honours the configured maximum as an absolute
             // upper bound (origin GCode.cpp:11116 applies it the same way).
-            hi = std::min(nominal, std::max(0.05f, settings.config_max_width_mm));
+            hi = std::min(nominal, std::max(0.05f, config_max));
         }
         lo = std::min(lo, hi);
 
@@ -391,12 +401,18 @@ WallModulation compute_wall_modulation(float                         weight,
     // -----------------------------------------------------------------------
     float offset = 0.f;
     if (settings.offset_surface) {
+        // 0 = derive from the nozzle: the full surface-travel budget, which
+        // "in and out" spends as +/- cap/2. A fixed millimetre default is wrong
+        // across nozzles -- 0.15 mm is 36% of a 0.4 mm nozzle's wall but 68% of
+        // a 0.2 mm nozzle's, and on the 0.2 it also sits above that machine's
+        // 0.20 mm cap so most of the setting's range does nothing.
+        const float requested = settings.offset_distance_mm > 0.f ? settings.offset_distance_mm : cap;
         // Bounded by twice the cap, not the cap: "in and out" spends only half
         // the distance in each direction, so a distance of 2*cap is what it
         // takes to reach the cap on either side. Nothing escapes the cap -- the
         // *total* travel is clamped to it below, which is the bound that
         // actually matters.
-        const float distance = std::clamp(settings.offset_distance_mm, 0.f, 2.f * cap);
+        const float distance = std::clamp(requested, 0.f, 2.f * cap);
         // weight 1 (the active filament matches the painted colour) puts the
         // wall at its most prominent; weight 0 makes it recede so the
         // neighbouring layers' colours read instead.

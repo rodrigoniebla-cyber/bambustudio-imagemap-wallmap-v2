@@ -172,6 +172,12 @@ enum class WallOffsetDirection {
     Outward = 2,
 };
 
+// Sentinel for the three millimetre settings below: derive the value from the
+// nozzle diameter and the path's own nominal width instead of taking it
+// literally. Mirrors the convention Bambu Studio already uses for
+// outer_wall_line_width, whose 0 means "work it out from line_width".
+inline constexpr float kAutoFromNozzle = 0.f;
+
 // Everything that decides how one external perimeter is modulated.
 //
 // The width half and the offset half are two different ways of making the
@@ -217,13 +223,23 @@ struct WallModulationSettings
     //        edge is pinned and only the outer surface moves: no over-extrusion
     //        into the inner walls, no reserved space needed, same visual effect.
     bool  allow_widening      { false };
-    float config_min_width_mm { 0.32f };   // texture_mapping_outer_wall_gradient_min_line_width
-    float config_max_width_mm { 0.95f };   // texture_mapping_outer_wall_gradient_max_line_width
-    float width_strength_pct  { 100.f };   // texture_mapping_outer_wall_gradient_global_strength
+    // These three are absolute millimetres, but 0 means "derive it from the
+    // nozzle and this path" (see kAutoFromNozzle). A fixed millimetre default
+    // cannot be right on every machine: 0.32 mm is a sane lower bound for the
+    // 0.42 mm wall of a 0.4 mm nozzle, and complete nonsense for the 0.22 mm
+    // wall of a 0.2 mm nozzle, where it exceeds the nominal width and collapses
+    // the sweep to nothing (narrow-only) or pins the wall permanently 45-91%
+    // over-extruded (widening). Auto keeps the same *proportions* on any nozzle.
+    float config_min_width_mm { kAutoFromNozzle };  // texture_mapping_outer_wall_gradient_min_line_width
+    float config_max_width_mm { kAutoFromNozzle };  // texture_mapping_outer_wall_gradient_max_line_width
+    float width_strength_pct  { 100.f };            // texture_mapping_outer_wall_gradient_global_strength
 
     // --- offset half (image_map_wall_offset_enable + its settings) ---------
     bool                offset_surface     { false };
-    float               offset_distance_mm { 0.15f };  // image_map_wall_offset_distance
+    // Also kAutoFromNozzle-aware: auto is the full surface-travel cap, which
+    // "in and out" spends as +/- cap/2. Use the toggle, not a zero distance, to
+    // turn the offset half off.
+    float               offset_distance_mm { kAutoFromNozzle };  // image_map_wall_offset_distance
     WallOffsetDirection offset_direction   { WallOffsetDirection::Both };
 
     // --- context, filled in by the caller from the path / printer ----------
