@@ -37,7 +37,7 @@ index a432007..430387b 100644
      ZLIB::ZLIB
      ${OCCT_LIBS}
 diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
-index ac30594..02b8cac 100644
+index ac30594..6d8154e 100644
 --- a/src/libslic3r/GCode.cpp
 +++ b/src/libslic3r/GCode.cpp
 @@ -1809,6 +1809,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
@@ -65,7 +65,7 @@ index ac30594..02b8cac 100644
      // extrude all loops ccw or cw according to config
      if (m_config.print_in_clockwise)
          bool was_clockwise = loop.make_clockwise();
-@@ -7090,6 +7101,224 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
+@@ -7090,6 +7101,229 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
      return res;
  }
  
@@ -260,8 +260,13 @@ index ac30594..02b8cac 100644
 +        if (is_hole)
 +            delta = -delta;
 +
++        // Hard ceiling on the miter join, so a sharp corner cannot displace a
++        // vertex past the surface-travel budget and leave a spike standing
++        // outside the wall path.
++        const double max_displacement = scale_(double(ImageMapPerLayer::max_surface_offset_mm(nozzle_diameter)));
++
 +        Points offset_ring;
-+        if (!ImageMapPerLayer::offset_closed_ring(ring, delta, offset_ring))
++        if (!ImageMapPerLayer::offset_closed_ring(ring, delta, offset_ring, max_displacement))
 +            return false; // degenerate/self-intersecting: leave the loop untouched
 +        if (offset_ring.size() != ring.size())
 +            return false;

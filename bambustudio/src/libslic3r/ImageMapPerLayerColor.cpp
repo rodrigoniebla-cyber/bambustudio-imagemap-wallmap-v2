@@ -447,7 +447,7 @@ WallModulation compute_wall_modulation(float                         weight,
     return out;
 }
 
-bool offset_closed_ring(const Points &ring, double delta, Points &out)
+bool offset_closed_ring(const Points &ring, double delta, Points &out, double max_displacement_limit)
 {
     const size_t n = ring.size();
     if (n < 3 || !std::isfinite(delta))
@@ -508,11 +508,30 @@ bool offset_closed_ring(const Points &ring, double delta, Points &out)
             return false;
     }
 
-    // A miter join can run away at a near-reversal corner; the origin clamps
-    // its per-segment shift too (clamped_shift_coord_for_gcode, bounded by
-    // scale_(max(0.5, base_outer_width))). Cap the displacement at 4x the
-    // requested offset, which leaves ordinary corners exact.
-    const double max_displacement = 4. * std::abs(delta);
+    // How far a vertex may travel.
+    //
+    // A miter join displaces a vertex by |delta| / cos(phi/2), where phi is the
+    // turn angle between the two adjacent edges' normals. That is what keeps
+    // both offset edges exactly parallel to their originals, but it runs away
+    // at sharp corners: a 90 degree corner already wants 1.41x, and a
+    // near-reversal (the needle-thin spikes Arachne and painted-region
+    // boundaries both produce) wants arbitrarily more.
+    //
+    // This used to be clamped at 4x, which is phi ~= 151 degrees -- so a spike
+    // in the toolpath could push the wall FOUR TIMES the requested offset
+    // outside the model. On a real Benchy that put 110 of 599 layers past the
+    // surface-travel cap, up to 1.34 mm out on a 0.35 mm budget: visible as
+    // loops standing outside the wall path.
+    //
+    // The feature's whole contract is that the surface moves by a bounded,
+    // sub-millimetre amount, so the bound wins over exact parallelism: clamp to
+    // a conventional miter limit (Clipper's default 2.0, which leaves every
+    // corner up to 120 degrees exact) AND to the caller's absolute ceiling.
+    // Beyond that the corner is beveled instead of mitered -- it loses a little
+    // sharpness, which is invisible next to a millimetre-long spike.
+    const double miter_limited = kOffsetRingMiterLimit * std::abs(delta);
+    const double max_displacement = (max_displacement_limit > 0.) ?
+        std::min(miter_limited, max_displacement_limit) : miter_limited;
 
     Points offset;
     offset.reserve(n);

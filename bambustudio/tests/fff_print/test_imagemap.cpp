@@ -514,6 +514,62 @@ TEST_CASE("imagemap: offset_closed_ring() miters a square inward and preserves v
     }
 }
 
+TEST_CASE("imagemap: offset_closed_ring() bounds how far a sharp corner may travel", "[ImageMapPerLayerColor]")
+{
+    // A miter join displaces a vertex by |delta| / cos(turn/2), which runs away
+    // at a near-reversal. This was clamped at 4x |delta|, so a needle-thin spike
+    // in the toolpath -- and Arachne and painted-region boundaries both produce
+    // them -- pushed the wall up to four times the requested offset outside the
+    // model. On a real Benchy that was 110 of 599 layers past the surface-travel
+    // cap, 1.34 mm out on a 0.35 mm budget, visible as loops standing outside
+    // the wall path.
+    const double delta = scale_(0.2);
+    auto mm = [](double v) { return coord_t(scale_(v)); };
+
+    // A 20 mm CCW square with a needle spike standing off its top edge: a body
+    // big enough that the ring survives the offset (a bare wedge would be
+    // refused by the collapse guard, which is separately correct), plus one
+    // vertex whose turn angle is sharp enough to make the miter run away.
+    Points spike{Point(0, 0),       Point(mm(20.), 0),    Point(mm(20.), mm(20.)),
+                 Point(mm(10.1), mm(20.)), Point(mm(10.), mm(24.)), Point(mm(9.9), mm(20.)),
+                 Point(0, mm(20.))};
+
+    auto max_travel = [&](const Points &before, const Points &after) {
+        double worst = 0.;
+        for (size_t i = 0; i < before.size(); ++i)
+            worst = std::max(worst, (after[i] - before[i]).cast<double>().norm());
+        return worst;
+    };
+
+    SECTION("the miter limit alone bounds it") {
+        Points out;
+        REQUIRE(Slic3r::ImageMapPerLayer::offset_closed_ring(spike, delta, out));
+        REQUIRE(out.size() == spike.size());
+        REQUIRE(max_travel(spike, out) <= Slic3r::ImageMapPerLayer::kOffsetRingMiterLimit * delta + 2.);
+    }
+
+    SECTION("an absolute ceiling bounds it further") {
+        const double ceiling = scale_(0.25);   // tighter than 2 * delta
+        Points out;
+        REQUIRE(Slic3r::ImageMapPerLayer::offset_closed_ring(spike, delta, out, ceiling));
+        REQUIRE(max_travel(spike, out) <= ceiling + 2.);
+    }
+
+    SECTION("ordinary corners are still exactly mitered") {
+        // 90 degrees wants 1.41x |delta|, inside the miter limit, so a square
+        // must still inset exactly -- the fix must not round off normal corners.
+        const coord_t s = coord_t(scale_(10.));
+        Points square{Point(0, 0), Point(s, 0), Point(s, s), Point(0, s)};
+        const double ceiling = scale_(0.35);
+        Points out;
+        REQUIRE(Slic3r::ImageMapPerLayer::offset_closed_ring(square, delta, out, ceiling));
+        REQUIRE(out[0].x() == Approx(delta).margin(2.));
+        REQUIRE(out[0].y() == Approx(delta).margin(2.));
+        REQUIRE(out[2].x() == Approx(double(s) - delta).margin(2.));
+        REQUIRE(out[2].y() == Approx(double(s) - delta).margin(2.));
+    }
+}
+
 TEST_CASE("imagemap: offset_closed_ring() refuses to collapse or invert a ring", "[ImageMapPerLayerColor]")
 {
     // A 0.4 mm square cannot survive a 0.5 mm inward offset; the caller must be

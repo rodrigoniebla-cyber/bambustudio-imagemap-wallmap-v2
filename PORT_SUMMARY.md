@@ -475,6 +475,41 @@ width floor still applies, so the preset can never request an unextrudable line.
 into three), so such a project loads cleanly and picks up the new defaults —
 surface offsetting on, width modulation off. Re-select the toggles you want.
 
+### The miter runaway: loops outside the wall path
+
+`offset_closed_ring()` displaces each vertex along its corner bisector by
+`|delta| / cos(turn/2)`. That is exactly what keeps both offset edges parallel
+to their originals, but it runs away as the corner sharpens: a 90° corner
+already wants 1.41x, and a near-reversal wants arbitrarily more. The
+displacement was clamped at **4x `|delta|`** — a 151° turn — on the reasoning
+that this "leaves ordinary corners exact".
+
+It does, but it also lets a *needle-thin spike* in the toolpath push the wall
+four times the requested offset outside the model, and both Arachne's
+variable-width perimeters and painted-region boundaries produce such spikes in
+quantity. Measured on the real Benchy as the maximum any layer's outer-wall
+silhouette grew beyond the unmodulated one:
+
+| | before | after | layers past the 0.35 mm cap (of 599) |
+|---|---|---|---|
+| offset only | 0.253 mm | 0.137 mm | 0 → 0 |
+| width only | 0.523 mm | 0.297 mm | 4 → 0 |
+| **combined preset** | **1.339 mm** | **0.350 mm** | **110 → 0** |
+
+The growth scaled with `delta` in every mode, which is what identified the
+clamp as the cause: offset-only stayed inside the cap by luck (its delta is
+small), not by design. Visually these were loops standing clear of the wall
+path — over a millimetre proud of the surface on the worst layers.
+
+The feature's contract is that the surface moves by a bounded, sub-millimetre
+amount, so the bound now wins over exact parallelism. `offset_closed_ring()`
+clamps to a conventional miter limit (`kOffsetRingMiterLimit = 2.0`, Clipper's
+default, leaving every corner up to 120° exact) *and* to an absolute ceiling the
+caller supplies — `GCode` passes `max_surface_offset_mm()`, the same cap the
+rest of the feature respects. Past that the corner is beveled rather than
+mitered: it loses a little sharpness, which is invisible next to a millimetre
+spike.
+
 ### What Phase 2 deliberately skips
 
 * **The width half never touches a loop containing overhang paths.** They are
@@ -559,6 +594,10 @@ painting, and 3MF persistence of zone definitions.
     a negative delta, and *refuses* — leaving the caller's geometry untouched —
     on rings it would collapse or invert, on fewer than 3 points, and on a zero
     delta.
+  * `offset_closed_ring()` bounds how far a sharp corner may travel, under the
+    miter limit alone and under a tighter absolute ceiling, while still mitering
+    an ordinary 90° corner exactly. See
+    [the miter runaway](#the-miter-runaway-loops-outside-the-wall-path).
 
   Two notes on running them, both pre-existing upstream conditions rather than
   anything this port introduces:

@@ -311,6 +311,11 @@ WallModulation compute_wall_modulation(float                         weight,
 // physically extrude and leave voids in the wall.
 float min_printable_width_mm(float nozzle_diameter_mm);
 
+// Miter limit for offset_closed_ring(): the largest multiple of |delta| a
+// vertex may be displaced before the join is beveled instead. 2.0 is Clipper's
+// default and leaves every corner up to 120 degrees exactly mitered.
+inline constexpr double kOffsetRingMiterLimit = 2.0;
+
 // Offset a closed ring of points by `delta` (scaled units) using miter joins,
 // preserving the vertex count so the caller can write the result back into the
 // individual ExtrusionPaths that make up the ring.
@@ -319,10 +324,18 @@ float min_printable_width_mm(float nozzle_diameter_mm);
 // the model's material" must negate it for hole loops, whose material is
 // outside the ring.
 //
+// `max_displacement_limit` (scaled units, <= 0 to disable) is a hard ceiling on
+// how far any single vertex may move, applied on top of the miter limit. Pass
+// the surface-travel cap: a miter join displaces a vertex by
+// |delta| / cos(turn/2), so without an absolute ceiling a sharp corner puts the
+// wall well outside the envelope the feature promises, as a spike standing
+// clear of the wall path.
+//
 // Returns false (leaving `out` untouched) when the ring is degenerate, when
 // the offset would collapse or invert it, or when the arithmetic overflows —
 // in which case the caller must leave the geometry unmodified.
-bool offset_closed_ring(const Points &ring, double delta, Points &out);
+bool offset_closed_ring(const Points &ring, double delta, Points &out,
+                        double max_displacement_limit = 0.);
 
 } // namespace ImageMapPerLayer
 } // namespace Slic3r
