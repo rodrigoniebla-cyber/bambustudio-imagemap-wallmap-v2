@@ -142,8 +142,16 @@ mkdir -p "$SRC_DIR/build"
   cmake --build . --target install --config Release -j"$NPROC"
 )
 
-APP_BUNDLE="$(find "$INSTALL_DIR" -maxdepth 2 -name '*.app' -print -quit)"
-[ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ] || die "no .app bundle found under $INSTALL_DIR after install"
+# CMake's install step leaves *two* things named BambuStudio.app under
+# $INSTALL_DIR: the real bundle in bin/, and (depending on the run) a
+# resources-only stub at the top level. `find -print -quit` picks whichever it
+# reaches first, so name the real one explicitly instead of gambling on the
+# traversal order.
+APP_BUNDLE="$INSTALL_DIR/bin/BambuStudio.app"
+[ -d "$APP_BUNDLE" ] || APP_BUNDLE="$(find "$INSTALL_DIR" -maxdepth 3 -name 'BambuStudio.app' \
+    -exec test -x '{}/Contents/MacOS/BambuStudio' \; -print -quit)"
+[ -n "$APP_BUNDLE" ] && [ -x "$APP_BUNDLE/Contents/MacOS/BambuStudio" ] \
+    || die "no .app bundle with an executable found under $INSTALL_DIR after install"
 log "Built app bundle: $APP_BUNDLE"
 
 # --------------------------------------------------------------------------
@@ -221,6 +229,52 @@ log "Packaging $DMG_NAME"
 STAGE_DIR="$(mktemp -d)"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 cp -R "$APP_BUNDLE" "$STAGE_DIR/"
+STAGED="$STAGE_DIR/$(basename "$APP_BUNDLE")"
+
+# CMake's install step points Contents/Resources at the build tree's ~400 MB
+# resource directory with a *symlink* rather than copying it, and `cp -R`
+# preserves symlinks. Every DMG built before this was fixed was therefore 57 MB
+# and silently depended on $BUILD_DIR/resources still existing, at that exact
+# absolute path, on the machine running the app -- printer profiles, filament
+# presets, calibration data and the web UI all live in there, so the app comes
+# up with nothing anywhere else. Copy the real tree in.
+log "Dereferencing symlinked resource trees so the bundle is self-contained"
+for name in Resources resources; do
+  link="$STAGED/Contents/$name"
+  [ -L "$link" ] || continue
+  target="$(readlink "$link")"
+  case "$target" in /*) ;; *) target="$STAGED/Contents/$target" ;; esac
+  [ -d "$target" ] || die "Contents/$name points at $target, which is not a directory"
+  log "  Contents/$name -> $target ($(du -sh "$target" | cut -f1))"
+  rm "$link"
+  cp -R "$target" "$link"
+done
+
+# Fail the build rather than ship another bundle that only works on the machine
+# that produced it.
+log "Verifying no absolute symlink escapes the bundle"
+python3 - "$STAGED" <<'PY' || die "bundle is not self-contained (see above)"
+import os, sys
+root = os.path.realpath(sys.argv[1])
+bad = []
+for dirpath, dirnames, filenames in os.walk(root):
+    for name in dirnames + filenames:
+        p = os.path.join(dirpath, name)
+        if os.path.islink(p):
+            t = os.readlink(p)
+            if os.path.isabs(t) and not os.path.realpath(t).startswith(root):
+                bad.append(f"{os.path.relpath(p, root)} -> {t}")
+if bad:
+    print("absolute symlinks leaving the bundle:")
+    for b in bad:
+        print("  " + b)
+    sys.exit(1)
+print("ok: no absolute symlinks escape the bundle")
+PY
+
+log "Re-signing after the resource copy"
+codesign --force --deep --sign - "$STAGED"
+
 ln -s /Applications "$STAGE_DIR/Applications"
 rm -f "$DMG_PATH"
 hdiutil create -volname "BambuStudio ImageMap" -srcfolder "$STAGE_DIR" -ov -format UDZO "$DMG_PATH"

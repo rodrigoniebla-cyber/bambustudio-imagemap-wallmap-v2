@@ -126,29 +126,6 @@ private:
     std::vector<float>                  m_empty_weights;
 };
 
-// Map a solver weight to an outer-wall line width. Port of the non-vertex
-// ("offset gradient") clamping formulas of GCode::_extrude() in origin
-// GCode.cpp (lines ~11118-11144): the wall keeps its nominal width where the
-// active filament fully matches the target color (weight 1) and narrows down
-// toward the configured/safe minimum where it does not (weight 0), so the
-// surrounding layers' colors show through.
-//   base_outer_width_mm     nominal width of the path being modulated
-//   config_min_width_mm     texture_mapping_outer_wall_gradient_min_line_width
-//   config_max_width_mm     texture_mapping_outer_wall_gradient_max_line_width (upper cap)
-//   global_strength_pct     texture_mapping_outer_wall_gradient_global_strength
-//   layer_height_mm         used for the positive-spacing lower bound
-//
-// Kept as the width-only entry point (Phase 1 behaviour, and the width half of
-// OuterWallMode::Inward). Phase 2 callers want compute_wall_modulation(),
-// which additionally returns the centerline shift that actually moves the
-// wall's outer surface.
-float modulated_outer_wall_width(float weight,
-                                 float base_outer_width_mm,
-                                 float config_min_width_mm,
-                                 float config_max_width_mm,
-                                 float global_strength_pct,
-                                 float layer_height_mm);
-
 // Volumetric flow (mm^3/mm) scale factor when an extrusion of rounded-rectangle
 // cross-section (width x height) is re-issued at new_width. Returns 1 when the
 // inputs are degenerate.
@@ -173,51 +150,99 @@ double flow_scale_for_width_change(float old_width_mm, float new_width_mm, float
 // the origin's per-segment point displacement.
 // ---------------------------------------------------------------------------
 
-// How the outer wall's surface is allowed to move relative to where the
-// unmodulated wall would have been.
-enum class OuterWallMode {
-    // Port of the origin's non-vertex "offset gradient" mode: the wall only
-    // ever narrows, so its outer surface only ever recedes *into* the model,
-    // by up to (nominal width - min width) * strength. The model never grows.
-    Inward = 0,
-    // Generalization of the origin's "vertex color match" mode: the width may
-    // also exceed the path's nominal width, so the surface swings symmetrically
-    // outward as well as inward around its nominal position. Gives a much
-    // larger colour swing at the cost of changing outer dimensions by up to
-    // the surface-offset cap (see max_surface_offset_mm()).
-    //
-    // DEVIATION FROM THE ORIGIN (deliberate): the origin's vertex-color-match
-    // widens the wall about a centerline pre-shifted inward by
-    // 0.5 * (max_line_width - nominal), which leaves the wall's *inner* edge
-    // far inside the nominal one, overlapping the wall behind it. The origin
-    // gets away with that because it also insets the slice surfaces at
-    // perimeter-generation time (origin LayerRegion.cpp,
-    // texture_mapping_offset_surface_inset_mm) so the space is reserved. That
-    // slice-time inset is Phase 3 scope here, so instead this mode pins the
-    // wall's inner edge to the nominal inner edge and lets only the outer
-    // surface move. No over-extrusion into the inner walls, no reserved-space
-    // requirement, same visual effect.
-    Centered = 1,
-    // Pure surface displacement: the line width and the volumetric flow are
-    // left EXACTLY as the perimeter generator set them, and only the wall's
-    // position moves, by +/- image_map_wall_offset_distance.
-    //
-    // This exists because modes 0/1 produce the colour swing by *thinning* the
-    // extrusion, which has two failure modes that show up badly on real models:
-    //   - Pushed hard (a small configured min line width) they ask for
-    //     extrusions far below what a nozzle can lay down -- a 0.05 mm minimum
-    //     on a 0.42 mm wall yields ~0.07 mm lines, which simply do not extrude,
-    //     leaving voids in the wall.
-    //   - Because re-widthing bridged material is not safe, loops containing
-    //     overhang paths have to be skipped, so on sloped regions (a hull
-    //     bottom, a roof) modulated and unmodulated loops sit side by side and
-    //     the surface breaks up -- while straight vertical walls, treated
-    //     uniformly, look fine.
-    // Holding the width constant removes both: nothing can be thinner than what
-    // the slicer already chose, and since flow is untouched there is no reason
-    // to skip overhang loops, so every external perimeter is treated alike.
-    OffsetOnly = 2,
+// The two halves of the effect are independent and composable, each behind its
+// own toggle (image_map_wall_width_enable / image_map_wall_offset_enable), with
+// a third toggle (image_map_wall_combined_preset) running both at fixed,
+// non-editable settings. See WallModulationSettings below.
+
+// Direction the *offset* half is allowed to move the wall's surface, relative
+// to where the perimeter generator put it.
+enum class WallOffsetDirection {
+    // Symmetric: weight 0..1 maps the surface to -d/2 .. +d/2 about nominal.
+    // Largest visual swing for a given distance, but the model's outer
+    // dimensions grow by up to d/2.
+    Both = 0,
+    // Inward only: weight 0..1 maps the surface to -d .. 0. The wall never
+    // travels past its nominal position, so outer dimensions are preserved
+    // exactly and the whole budget goes into receding.
+    Inward = 1,
+    // Outward only: weight 0..1 maps the surface to 0 .. +d. The wall never
+    // cuts into the model, so nothing is ever under-filled behind it; the
+    // matching layer bulges proud instead. Dimensions grow by up to d.
+    Outward = 2,
 };
+
+// Everything that decides how one external perimeter is modulated.
+//
+// The width half and the offset half are two different ways of making the
+// wall's surface move, with different trade-offs, and they add:
+//
+//  * Width half (`modulate_width`) - a port of the origin's outer-wall
+//    gradient. Re-widths the extrusion and shifts the centerline by half the
+//    width change, which pins the wall's *inner* edge and moves only the outer
+//    surface. Because it changes how much material is laid down, it changes
+//    the colour's opacity as well as its position -- a receding layer is both
+//    further back and thinner, so it reads much weaker. Its costs: it cannot
+//    be applied to bridged/overhang material (re-widthing that is not safe),
+//    and pushed hard it asks for extrusions below what a nozzle can lay down
+//    (hence min_printable_width_mm(), which is not in the origin).
+//  * Offset half (`offset_surface`) - a pure translation of the ring. Width
+//    and volumetric flow are left EXACTLY as the perimeter generator set them,
+//    so nothing can be too thin to extrude and overhang loops need no special
+//    case. Its cost: because the whole extrusion moves, a wall pushed outward
+//    opens an equally sized gap behind it, against the wall it used to touch.
+//
+// Running both is what the "combined" preset does: the width half provides most
+// of the surface travel plus the opacity change, and the offset half adds the
+// rest of the travel on top, with the total still clamped to
+// max_surface_offset_mm(). See combined_preset_settings().
+struct WallModulationSettings
+{
+    // --- width half (image_map_wall_width_enable + its settings) -----------
+    bool  modulate_width      { false };
+    // false: the wall may only narrow, so the surface only ever recedes into
+    //        the model and outer dimensions never grow (the origin's non-vertex
+    //        "offset gradient" mode).
+    // true:  the wall may also exceed its nominal width, so the surface swings
+    //        outward as well as inward, roughly doubling the colour range.
+    //
+    //        DEVIATION FROM THE ORIGIN (deliberate): the origin's
+    //        vertex-color-match widens the wall about a centerline pre-shifted
+    //        inward by 0.5 * (max_line_width - nominal), which leaves the wall's
+    //        inner edge far inside the nominal one, overlapping the wall behind
+    //        it. The origin gets away with that because it also insets the slice
+    //        surfaces at perimeter-generation time (origin LayerRegion.cpp,
+    //        texture_mapping_offset_surface_inset_mm) so the space is reserved.
+    //        That slice-time inset is Phase 3 scope here, so instead the inner
+    //        edge is pinned and only the outer surface moves: no over-extrusion
+    //        into the inner walls, no reserved space needed, same visual effect.
+    bool  allow_widening      { false };
+    float config_min_width_mm { 0.32f };   // texture_mapping_outer_wall_gradient_min_line_width
+    float config_max_width_mm { 0.95f };   // texture_mapping_outer_wall_gradient_max_line_width
+    float width_strength_pct  { 100.f };   // texture_mapping_outer_wall_gradient_global_strength
+
+    // --- offset half (image_map_wall_offset_enable + its settings) ---------
+    bool                offset_surface     { false };
+    float               offset_distance_mm { 0.15f };  // image_map_wall_offset_distance
+    WallOffsetDirection offset_direction   { WallOffsetDirection::Both };
+
+    // --- context, filled in by the caller from the path / printer ----------
+    float layer_height_mm    { 0.2f };
+    float nozzle_diameter_mm { 0.4f };
+
+    bool any_effect() const { return modulate_width || offset_surface; }
+};
+
+// The fixed settings behind image_map_wall_combined_preset: both halves on,
+// nothing user-adjustable, sized off the nozzle so they are safe on any
+// machine. The surface-travel budget (max_surface_offset_mm()) is split evenly:
+// the width half sweeps +/- cap/2 about the nominal width, and the offset half
+// adds another +/- cap/2 on top, for a full-scale swing of +/- cap.
+// `config_min_width_mm` is additionally floored at min_printable_width_mm() by
+// compute_wall_modulation(), so this can never request an unextrudable line.
+WallModulationSettings combined_preset_settings(float path_nominal_width_mm,
+                                                float layer_height_mm,
+                                                float nozzle_diameter_mm);
 
 // Result of modulating one external perimeter.
 struct WallModulation
@@ -225,12 +250,19 @@ struct WallModulation
     // False when the modulation is a no-op and the caller should leave the
     // loop exactly as it found it.
     bool   active { false };
-    // New extrusion width, mm.
+    // New extrusion width, mm. Equal to the path's nominal width whenever the
+    // width half is off, in which case `width_changed` is false and the caller
+    // must leave every path's width and mm3_per_mm alone.
     float  width_mm { 0.f };
+    bool   width_changed { false };
     // Distance to move the toolpath centerline, mm. Positive moves the
     // centerline *toward the model's material* (so the outer surface recedes);
-    // negative moves it away (the surface bulges outward).
+    // negative moves it away (the surface bulges outward). Zero (and
+    // `ring_moves` false) when the two halves happen to cancel out, which is a
+    // legitimate outcome the caller must not confuse with "no modulation":
+    // the width change still has to be applied.
     float  centerline_shift_mm { 0.f };
+    bool   ring_moves { false };
     // Multiplier for the path's mm3_per_mm, relative to its nominal width.
     double flow_scale { 1.0 };
     // Signed distance the outer surface ends up from where it would have been,
@@ -245,41 +277,32 @@ struct WallModulation
 // 2 * max_allowed_distance) (origin GCode.cpp:11026).
 float max_surface_offset_mm(float nozzle_diameter_mm);
 
-// Width + centerline shift for one external perimeter.
+// Width + centerline shift for one external perimeter, composing whichever of
+// the two halves `settings` has enabled.
 //
-// The centerline shift is chosen so the wall's inner edge stays exactly where
-// the perimeter generator put it:
-//     shift = 0.5 * (nominal_width - new_width)
+// Width half: the centerline shift is chosen so the wall's inner edge stays
+// exactly where the perimeter generator put it,
+//     shift_width = 0.5 * (nominal_width - new_width)
 // which is identical to the origin's offset-gradient shift (there
 // base_outer_width == nominal, so 0.5 * width_delta == 0.5 * (nominal - new)),
 // and which makes the outer surface move by exactly (new_width - nominal).
 //
-// In OffsetOnly mode the width is left alone entirely and the surface is
-// displaced by up to `offset_distance_mm` instead:
-//   inward_only == false -> weight 0..1 maps to -d/2 .. +d/2 about nominal
-//   inward_only == true  -> weight 0..1 maps to -d   .. 0    (never grows)
+// Offset half: a pure translation on top, shift_offset = -surface_offset.
+//
+// The two add:
+//     centerline_shift = 0.5 * (nominal - width) - offset
+//     surface travel   = (width - nominal) + offset
+// and the *total* surface travel is clamped to max_surface_offset_mm(); any
+// excess is taken out of the offset half, which is the one with no lower bound
+// of its own.
 //
 //   weight                in [0,1] from Solver::weight_for(); 1 = the active
 //                         filament fully matches the painted target colour
 //   path_nominal_width_mm the width the perimeter generator assigned
-//   config_min/max_mm     texture_mapping_outer_wall_gradient_{min,max}_line_width
-//                         (unused in OffsetOnly mode)
-//   global_strength_pct   texture_mapping_outer_wall_gradient_global_strength
-//   layer_height_mm       for the positive-spacing lower bound
-//   nozzle_diameter_mm    for max_surface_offset_mm(), and for the minimum
-//                         *printable* width floor in the width-modulating modes
-//   offset_distance_mm    image_map_wall_offset_distance (OffsetOnly only)
-//   inward_only           image_map_wall_offset_inward_only (OffsetOnly only)
-WallModulation compute_wall_modulation(float         weight,
-                                       float         path_nominal_width_mm,
-                                       float         config_min_width_mm,
-                                       float         config_max_width_mm,
-                                       float         global_strength_pct,
-                                       float         layer_height_mm,
-                                       float         nozzle_diameter_mm,
-                                       OuterWallMode mode,
-                                       float         offset_distance_mm = 0.15f,
-                                       bool          inward_only        = false);
+//   settings              the two halves and their settings; see above
+WallModulation compute_wall_modulation(float                         weight,
+                                       float                         path_nominal_width_mm,
+                                       const WallModulationSettings &settings);
 
 // Smallest width worth asking a nozzle to extrude: half the nozzle diameter
 // (0.2 mm on a 0.4 mm nozzle), floored at 0.05 mm. The width-modulating modes

@@ -37,7 +37,7 @@ index a432007..430387b 100644
      ZLIB::ZLIB
      ${OCCT_LIBS}
 diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
-index ac30594..06a39b0 100644
+index ac30594..02b8cac 100644
 --- a/src/libslic3r/GCode.cpp
 +++ b/src/libslic3r/GCode.cpp
 @@ -1809,6 +1809,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
@@ -65,7 +65,7 @@ index ac30594..06a39b0 100644
      // extrude all loops ccw or cw according to config
      if (m_config.print_in_clockwise)
          bool was_clockwise = loop.make_clockwise();
-@@ -7090,6 +7101,181 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
+@@ -7090,6 +7101,224 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
      return res;
  }
  
@@ -92,6 +92,13 @@ index ac30594..06a39b0 100644
 +    m_image_map_modulation_enabled = false;
 +    if (!ImageMapPerLayer::enabled(print.config()))
 +        return; // default OFF — strict no-op
++    // With all three wall-map toggles off the feature still collapses tool
++    // changes, but no wall is ever modulated, so there is nothing to solve --
++    // skip building the solver (which decodes a 37 MB colour LUT).
++    if (!print.config().image_map_wall_combined_preset.value &&
++        !print.config().image_map_wall_width_enable.value &&
++        !print.config().image_map_wall_offset_enable.value)
++        return;
 +    // Read the rotation set ToolOrdering already computed (Print::process()
 +    // runs before do_export(), so print.tool_ordering() is populated by now)
 +    // instead of independently recomputing it here: ToolOrdering derives the
@@ -106,6 +113,16 @@ index ac30594..06a39b0 100644
 +    m_image_map_modulation_enabled = true;
 +}
 +
++static ImageMapPerLayer::WallOffsetDirection image_map_offset_direction(ImageMapWallOffsetDirection value)
++{
++    switch (value) {
++    case ImageMapWallOffsetDirection::Inward:  return ImageMapPerLayer::WallOffsetDirection::Inward;
++    case ImageMapWallOffsetDirection::Outward: return ImageMapPerLayer::WallOffsetDirection::Outward;
++    case ImageMapWallOffsetDirection::Both:
++    default:                                   return ImageMapPerLayer::WallOffsetDirection::Both;
++    }
++}
++
 +bool GCode::image_map_modulate_outer_wall_loop(ExtrusionLoop &loop)
 +{
 +    if (!m_image_map_modulation_enabled)
@@ -115,30 +132,19 @@ index ac30594..06a39b0 100644
 +    if (loop.paths.empty() || m_writer.filament() == nullptr)
 +        return false;
 +
-+    const auto mode = m_config.image_map_outer_wall_mode.value == 2 ? ImageMapPerLayer::OuterWallMode::OffsetOnly :
-+                      m_config.image_map_outer_wall_mode.value == 1 ? ImageMapPerLayer::OuterWallMode::Centered :
-+                                                                     ImageMapPerLayer::OuterWallMode::Inward;
-+    // OffsetOnly leaves width and flow exactly as the perimeter generator set
-+    // them and only translates the ring, so it is safe on every external
-+    // perimeter -- including loops containing overhang paths, whose bridged
-+    // material keeps its own flow and speed handling untouched.
-+    //
-+    // The width-modulating modes are not safe there: re-widthing bridged
-+    // material changes its flow, and shifting an overhang path *without*
-+    // re-widthing it (while the rest of the ring narrows) would push it into
-+    // the wall behind. Those modes therefore skip such loops entirely -- which
-+    // is exactly why they break up sloped regions like a hull bottom or a roof,
-+    // where modulated and unmodulated loops end up side by side, while straight
-+    // vertical walls come out uniform.
-+    const bool width_is_modulated = mode != ImageMapPerLayer::OuterWallMode::OffsetOnly;
-+    if (width_is_modulated && loop.has_overhang_paths())
-+        return false;
++    // The three toggles. "Combined" wins outright and runs both halves at the
++    // fixed settings of ImageMapPerLayer::combined_preset_settings(), ignoring
++    // the other two toggles and every one of their settings.
++    const bool combined    = m_config.image_map_wall_combined_preset.value;
++    bool       want_width  = combined || m_config.image_map_wall_width_enable.value;
++    const bool want_offset = combined || m_config.image_map_wall_offset_enable.value;
++    if (!want_width && !want_offset)
++        return false; // the wall map is off; tool-change collapsing still applies
++
 +    for (const ExtrusionPath &path : loop.paths) {
 +        if (path.is_force_no_extrusion() || path.polyline.points.size() < 2)
 +            return false;
-+        if (width_is_modulated && path.role() != erExternalPerimeter)
-+            return false;
-+        if (!width_is_modulated && !is_perimeter(path.role()))
++        if (!is_perimeter(path.role()))
 +            return false;
 +    }
 +    // The ring must actually close for the flatten/offset/write-back below to
@@ -157,17 +163,34 @@ index ac30594..06a39b0 100644
 +        if (a.x() != b.x() || a.y() != b.y())
 +            return false;
 +    }
-+    // A single width for the whole ring keeps the centerline shift constant,
-+    // which is what makes the one-shot miter offset valid. OffsetOnly does not
-+    // derive its shift from the width at all, so a ring whose paths differ in
-+    // width (an overhang segment, typically) is still perfectly offsettable.
 +    const float nominal_width = loop.paths.front().width;
 +    if (nominal_width <= EPSILON)
 +        return false;
-+    if (width_is_modulated)
++
++    // Can this loop take a *width* change? Only if none of it is bridged or
++    // overhanging material (re-widthing that is not safe, and shifting it
++    // without re-widthing it while the rest of the ring narrows would push it
++    // into the wall behind), and only if the whole ring shares one width, which
++    // is what keeps the paired centerline shift constant and the one-shot miter
++    // offset valid.
++    bool width_safe = !loop.has_overhang_paths();
++    if (width_safe)
 +        for (const ExtrusionPath &path : loop.paths)
-+            if (std::abs(path.width - nominal_width) > 1e-4f)
-+                return false;
++            if (path.role() != erExternalPerimeter || std::abs(path.width - nominal_width) > 1e-4f) {
++                width_safe = false;
++                break;
++            }
++    if (want_width && !width_safe) {
++        // Fall back to offsetting this one loop rather than skipping it. Left
++        // out entirely, sloped regions (a hull bottom, a roof) end up with
++        // modulated and unmodulated loops side by side and the surface visibly
++        // breaks up, while straight vertical walls come out uniform -- the
++        // "the middle looks fine, the top and bottom are a mess" signature.
++        // The offset half has no such restriction, so it covers these loops.
++        want_width = false;
++        if (!want_offset)
++            return false;
++    }
 +
 +    // extrude_perimeters() applies the region config into m_config before
 +    // extruding, so wall_filament here is the painted region's original
@@ -184,63 +207,83 @@ index ac30594..06a39b0 100644
 +        float(m_layer != nullptr ? m_layer->height : m_last_height);
 +    const float nozzle_diameter = float(EXTRUDER_CONFIG(nozzle_diameter));
 +
-+    const ImageMapPerLayer::WallModulation modulation = ImageMapPerLayer::compute_wall_modulation(
-+        weight,
-+        nominal_width,
-+        float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value),
-+        float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value),
-+        float(m_config.texture_mapping_outer_wall_gradient_global_strength.value),
-+        layer_height,
-+        nozzle_diameter,
-+        mode,
-+        float(m_config.image_map_wall_offset_distance.value),
-+        m_config.image_map_wall_offset_inward_only.value);
++    ImageMapPerLayer::WallModulationSettings settings;
++    if (combined) {
++        settings = ImageMapPerLayer::combined_preset_settings(nominal_width, layer_height, nozzle_diameter);
++        if (!want_width) {
++            // This loop is bridged/overhanging, so the width half was dropped
++            // above. Hand its share of the surface-travel budget to the offset
++            // half instead of leaving the loop at half amplitude: the whole
++            // point of covering these loops is that they end up looking like
++            // their neighbours, which they would not at half the swing.
++            settings.modulate_width     = false;
++            settings.offset_distance_mm = 2.f * ImageMapPerLayer::max_surface_offset_mm(nozzle_diameter);
++        }
++    } else {
++        settings.modulate_width      = want_width;
++        settings.allow_widening      = m_config.image_map_wall_width_allow_widening.value;
++        settings.config_min_width_mm = float(m_config.texture_mapping_outer_wall_gradient_min_line_width.value);
++        settings.config_max_width_mm = float(m_config.texture_mapping_outer_wall_gradient_max_line_width.value);
++        settings.width_strength_pct  = float(m_config.texture_mapping_outer_wall_gradient_global_strength.value);
++        settings.offset_surface      = want_offset;
++        settings.offset_distance_mm  = float(m_config.image_map_wall_offset_distance.value);
++        settings.offset_direction    = image_map_offset_direction(m_config.image_map_wall_offset_direction.value);
++        settings.layer_height_mm     = layer_height;
++        settings.nozzle_diameter_mm  = nozzle_diameter;
++    }
++
++    const ImageMapPerLayer::WallModulation modulation =
++        ImageMapPerLayer::compute_wall_modulation(weight, nominal_width, settings);
 +    if (!modulation.active)
 +        return false;
 +
-+    // Flatten the loop into one ring of vertices. Consecutive paths share an
-+    // endpoint, so each path contributes all but its last point; the last path's
-+    // last point is the first path's first point.
-+    Points ring;
-+    std::vector<size_t> path_start;
-+    path_start.reserve(loop.paths.size());
-+    for (const ExtrusionPath &path : loop.paths) {
-+        path_start.emplace_back(ring.size());
-+        const Points &pts = path.polyline.points;
-+        ring.insert(ring.end(), pts.begin(), pts.end() - 1);
-+    }
-+    if (ring.size() < 3)
-+        return false;
++    if (modulation.ring_moves) {
++        // Flatten the loop into one ring of vertices. Consecutive paths share an
++        // endpoint, so each path contributes all but its last point; the last
++        // path's last point is the first path's first point.
++        Points ring;
++        std::vector<size_t> path_start;
++        path_start.reserve(loop.paths.size());
++        for (const ExtrusionPath &path : loop.paths) {
++            path_start.emplace_back(ring.size());
++            const Points &pts = path.polyline.points;
++            ring.insert(ring.end(), pts.begin(), pts.end() - 1);
++        }
++        if (ring.size() < 3)
++            return false;
 +
-+    // ImageMapPerLayer::offset_closed_ring() offsets toward the ring's own
-+    // interior. For a hole the model's material is *outside* the ring, so the
-+    // "toward the material" shift has to be negated.
-+    const bool is_hole = (loop.loop_role() & elrPerimeterHole) != 0;
-+    double delta = scale_(double(modulation.centerline_shift_mm));
-+    if (is_hole)
-+        delta = -delta;
++        // ImageMapPerLayer::offset_closed_ring() offsets toward the ring's own
++        // interior. For a hole the model's material is *outside* the ring, so
++        // the "toward the material" shift has to be negated.
++        const bool is_hole = (loop.loop_role() & elrPerimeterHole) != 0;
++        double delta = scale_(double(modulation.centerline_shift_mm));
++        if (is_hole)
++            delta = -delta;
 +
-+    Points offset_ring;
-+    if (!ImageMapPerLayer::offset_closed_ring(ring, delta, offset_ring))
-+        return false; // degenerate/self-intersecting: leave the loop untouched
-+    if (offset_ring.size() != ring.size())
-+        return false;
++        Points offset_ring;
++        if (!ImageMapPerLayer::offset_closed_ring(ring, delta, offset_ring))
++            return false; // degenerate/self-intersecting: leave the loop untouched
++        if (offset_ring.size() != ring.size())
++            return false;
 +
-+    // Write the offset vertices back, keeping every path's point count and the
-+    // shared endpoints consistent.
-+    const size_t n = ring.size();
-+    for (size_t p = 0; p < loop.paths.size(); ++p) {
-+        Points &pts = loop.paths[p].polyline.points;
-+        for (size_t i = 0; i < pts.size(); ++i)
-+            pts[i] = offset_ring[(path_start[p] + i) % n];
-+        // OffsetOnly reports width_mm == nominal and flow_scale == 1, so both
-+        // of these are exact no-ops there and each path keeps its own width --
-+        // including an overhang path's, which must not be touched.
-+        if (width_is_modulated) {
-+            loop.paths[p].width = modulation.width_mm;
-+            loop.paths[p].mm3_per_mm *= modulation.flow_scale;
++        // Write the offset vertices back, keeping every path's point count and
++        // the shared endpoints consistent.
++        const size_t n = ring.size();
++        for (size_t p = 0; p < loop.paths.size(); ++p) {
++            Points &pts = loop.paths[p].polyline.points;
++            for (size_t i = 0; i < pts.size(); ++i)
++                pts[i] = offset_ring[(path_start[p] + i) % n];
 +        }
 +    }
++
++    // Only ever touched when the width half ran and actually changed something:
++    // otherwise each path keeps its own width, including an overhang path's,
++    // which must not be re-widthed.
++    if (modulation.width_changed)
++        for (ExtrusionPath &path : loop.paths) {
++            path.width = modulation.width_mm;
++            path.mm3_per_mm *= modulation.flow_scale;
++        }
 +    return true;
 +}
 +
@@ -524,27 +567,43 @@ index 8735207..43f9d60 100644
      // Used by gradient run detection to distinguish real gaps (object has a layer
      // that doesn't use the slot) from spurious gaps (another object's layer).
 diff --git a/src/libslic3r/Preset.cpp b/src/libslic3r/Preset.cpp
-index 632b750..4133be5 100644
+index 632b750..b1cf220 100644
 --- a/src/libslic3r/Preset.cpp
 +++ b/src/libslic3r/Preset.cpp
-@@ -1059,6 +1059,12 @@ static std::vector<std::string> s_Preset_print_options {
+@@ -1059,6 +1059,14 @@ static std::vector<std::string> s_Preset_print_options {
      "prime_tower_flat_ironing","enable_circle_compensation", "circle_compensation_manual_offset", "apply_scarf_seam_on_circles",
      "wipe_tower_no_sparse_layers", "compatible_printers", "compatible_printers_condition", "inherits",
      "flush_into_infill", "flush_into_objects", "flush_into_support","process_notes", "enable_mixed_color_sublayer",
 +    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap); default off.
-+    "image_map_per_layer_color_rotation", "texture_mapping_outer_wall_gradient_global_strength",
++    "image_map_per_layer_color_rotation",
++    "image_map_wall_width_enable", "image_map_wall_width_allow_widening",
++    "texture_mapping_outer_wall_gradient_global_strength",
 +    "texture_mapping_outer_wall_gradient_max_line_width", "texture_mapping_outer_wall_gradient_min_line_width",
++    "image_map_wall_offset_enable", "image_map_wall_offset_distance", "image_map_wall_offset_direction",
++    "image_map_wall_combined_preset",
 +    "image_map_generic_solver_lookup_mode", "image_map_generic_solver_mode", "image_map_generic_solver_mix_model",
-+    "image_map_outer_wall_mode", "image_map_wall_offset_distance",
-+    "image_map_wall_offset_inward_only",
      // BBS
       "tree_support_branch_angle", "tree_support_wall_count", "tree_support_branch_distance", "tree_support_branch_diameter",
      "tree_support_branch_diameter_angle",
 diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
-index 7d8ab09..13c1610 100644
+index 7d8ab09..07a567b 100644
 --- a/src/libslic3r/PrintConfig.cpp
 +++ b/src/libslic3r/PrintConfig.cpp
-@@ -6050,6 +6050,126 @@ void PrintConfigDef::init_fff_params()
+@@ -209,6 +209,13 @@ static t_config_enum_values s_keys_map_NoiseType {
+ };
+ CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(NoiseType)
+ 
++static t_config_enum_values s_keys_map_ImageMapWallOffsetDirection {
++    { "both",    int(ImageMapWallOffsetDirection::Both) },
++    { "inward",  int(ImageMapWallOffsetDirection::Inward) },
++    { "outward", int(ImageMapWallOffsetDirection::Outward) }
++};
++CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ImageMapWallOffsetDirection)
++
+ static t_config_enum_values s_keys_map_FuzzySkinMode {
+     { "displacement", int(FuzzySkinMode::Displacement) },
+     { "extrusion",    int(FuzzySkinMode::Extrusion) },
+@@ -6050,6 +6057,184 @@ void PrintConfigDef::init_fff_params()
      def->mode = comSimple;
      def->set_default_value(new ConfigOptionBool(false));
  
@@ -562,12 +621,45 @@ index 7d8ab09..13c1610 100644
 +    def->mode = comDevelop;
 +    def->set_default_value(new ConfigOptionBool(false));
 +
-+    // The following three options are ported verbatim from OrcaSlicer-ImageMap
-+    // PrintConfig.cpp (same names, defaults and ranges).
-+    def = this->add("texture_mapping_outer_wall_gradient_global_strength", coFloat);
-+    def->label = L("Outer wall offset gradient global strength");
++    // -----------------------------------------------------------------------
++    // Wall map, toggle 1: vary the outer wall's LINE WIDTH.
++    // -----------------------------------------------------------------------
++    def = this->add("image_map_wall_width_enable", coBool);
++    def->label = L("Vary outer wall line width");
 +    def->category = L("Multimaterial");
-+    def->tooltip = L("Global strength multiplier for texture mapping outer wall offset gradients.");
++    def->tooltip = L("Approximate the painted color by varying the outer wall's extrusion width: "
++                     "full width on the layer whose filament matches the painted color, narrower "
++                     "on the layers that do not, so those recede into the model and the matching "
++                     "layers read through. The wall's inner edge stays where the slicer put it, so "
++                     "this never over-extrudes into the wall behind. "
++                     "Because it changes how much material is laid down, it changes the color's "
++                     "opacity as well as its position, which is the strongest single effect - but "
++                     "it cannot be applied to bridged/overhang material, so on sloped surfaces "
++                     "some loops are left unmodulated unless 'Offset outer wall surface' is also "
++                     "on to cover them.");
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionBool(false));
++
++    def = this->add("image_map_wall_width_allow_widening", coBool);
++    def->label = L("Allow the wall to widen");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Let the outer wall exceed its nominal line width on matching layers, instead "
++                     "of only narrowing on non-matching ones. The surface then swings outward as "
++                     "well as inward, roughly doubling the color range, at the cost of growing the "
++                     "model's outer dimensions by up to the surface travel cap (the nozzle "
++                     "diameter, at most 0.35 mm). Only used when 'Vary outer wall line width' is on.");
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionBool(false));
++
++    // The following three options are ported verbatim from OrcaSlicer-ImageMap
++    // PrintConfig.cpp (same names, defaults and ranges). They are the settings
++    // of the width toggle above.
++    def = this->add("texture_mapping_outer_wall_gradient_global_strength", coFloat);
++    def->label = L("Line width variation strength");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Scales the whole line-width swing about the nominal width. 0% is an exact "
++                     "no-op, 100% uses the full range set below. Only used when 'Vary outer wall "
++                     "line width' is on.");
 +    def->sidetext = "%";
 +    def->min = 0.0;
 +    def->max = 100.0;
@@ -577,7 +669,10 @@ index 7d8ab09..13c1610 100644
 +    def = this->add("texture_mapping_outer_wall_gradient_max_line_width", coFloat);
 +    def->label = L("Maximum outer wall line width");
 +    def->category = L("Multimaterial");
-+    def->tooltip = L("Upper bound for external perimeter line width used by texture mapping.");
++    def->tooltip = L("Upper bound for the modulated external perimeter width. Only has an effect "
++                     "above the nominal width when 'Allow the wall to widen' is on, and the "
++                     "resulting surface movement is capped at the nozzle diameter (max 0.35 mm) "
++                     "regardless. Only used when 'Vary outer wall line width' is on.");
 +    def->sidetext = "mm";
 +    def->min = 0.05;
 +    def->max = 3.0;
@@ -587,7 +682,10 @@ index 7d8ab09..13c1610 100644
 +    def = this->add("texture_mapping_outer_wall_gradient_min_line_width", coFloat);
 +    def->label = L("Minimum outer wall line width");
 +    def->category = L("Multimaterial");
-+    def->tooltip = L("Lower bound for external perimeter line width used by texture mapping outer wall gradient effects.");
++    def->tooltip = L("Lower bound for the modulated external perimeter width. Values below what "
++                     "the nozzle can actually extrude (half the nozzle diameter) are raised to "
++                     "that floor: asking for lines thinner than that does not produce a thinner "
++                     "wall, it produces gaps. Only used when 'Vary outer wall line width' is on.");
 +    def->sidetext = "mm";
 +    def->min = 0.05;
 +    def->max = 2.0;
@@ -621,75 +719,141 @@ index 7d8ab09..13c1610 100644
 +    def->mode = comDevelop;
 +    def->set_default_value(new ConfigOptionInt(0));
 +
-+    // Phase 2: how far, and in which direction, the modulated outer wall's
-+    // surface is allowed to move from where the perimeter generator put it.
-+    // Both modes keep the wall's inner edge fixed, so neither can over-extrude
-+    // into the wall behind it.
-+    def = this->add("image_map_outer_wall_mode", coInt);
-+    def->label = L("Image-map outer wall mode");
-+    def->tooltip = L("How the outer wall approximates the painted color. "
-+                     "0: narrow inward - the wall only narrows, so the surface recedes into the "
-+                     "model and outer dimensions never grow (ported from OrcaSlicer-ImageMap's "
-+                     "offset gradient mode). "
-+                     "1: narrow centered - the wall may also widen past its nominal width, so the "
-+                     "surface swings both outward and inward, roughly doubling the color range. "
-+                     "2: offset only (recommended) - the line width and flow are left exactly as "
-+                     "the slicer set them and only the wall's position moves, by the distance set "
-+                     "in 'Image-map wall offset distance'. Modes 0 and 1 create the color effect "
-+                     "by thinning the extrusion, which can request lines too thin to extrude "
-+                     "(leaving voids) and which forces overhang loops to be skipped, breaking up "
-+                     "sloped surfaces. Mode 2 has neither problem. "
-+                     "Surface movement is capped at the nozzle diameter (max 0.35 mm) in all modes.");
-+    def->min = 0;
-+    def->max = 2;
++    // -----------------------------------------------------------------------
++    // Wall map, toggle 2: move the outer wall's SURFACE, in or out.
++    // -----------------------------------------------------------------------
++    def = this->add("image_map_wall_offset_enable", coBool);
++    def->label = L("Offset outer wall surface");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Approximate the painted color by moving the outer wall itself: the whole "
++                     "external perimeter is translated in or out, while its line width and flow "
++                     "are left exactly as the slicer set them. Because nothing is re-widthed, "
++                     "nothing can end up too thin to extrude and overhang loops need no special "
++                     "case, so every external perimeter is treated alike - this is the safe "
++                     "option on real models. Its cost is that a wall pushed outward opens an "
++                     "equally sized gap behind it, against the wall it used to touch.");
 +    def->mode = comDevelop;
-+    def->set_default_value(new ConfigOptionInt(2));
++    def->set_default_value(new ConfigOptionBool(true));
 +
 +    def = this->add("image_map_wall_offset_distance", coFloat);
-+    def->label = L("Image-map wall offset distance");
++    def->label = L("Wall offset distance");
 +    def->category = L("Multimaterial");
-+    def->tooltip = L("Peak distance the outer wall's surface is moved in 'offset only' mode "
-+                     "(image_map_outer_wall_mode = 2). Larger values give a stronger color effect "
-+                     "but a rougher surface. Clamped to the nozzle diameter (max 0.35 mm). "
-+                     "Ignored in the other modes.");
++    def->tooltip = L("Peak distance the outer wall's surface travels. Larger values give a "
++                     "stronger color effect and a rougher surface. Clamped to the nozzle diameter "
++                     "(max 0.35 mm). Only used when 'Offset outer wall surface' is on.");
 +    def->sidetext = "mm";
 +    def->min = 0.0;
 +    def->max = 0.35;
 +    def->mode = comDevelop;
 +    def->set_default_value(new ConfigOptionFloat(0.15));
 +
-+    def = this->add("image_map_wall_offset_inward_only", coBool);
-+    def->label = L("Image-map wall offset inward only");
-+    def->tooltip = L("In 'offset only' mode, move the wall only inward (never outward past its "
-+                     "nominal position), so the model's outer dimensions are preserved. When off, "
-+                     "the wall swings symmetrically outward and inward around its nominal "
-+                     "position, which halves the movement in each direction for the same offset "
-+                     "distance. Ignored in the other modes.");
++    def = this->add("image_map_wall_offset_direction", coEnum);
++    def->label = L("Wall offset direction");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Which way the wall is allowed to travel:\n"
++                     "In and out: swings symmetrically about its nominal position, +/- half the "
++                     "offset distance. Biggest visual swing; outer dimensions grow slightly.\n"
++                     "Inward only: never travels past its nominal position, so the model's outer "
++                     "dimensions are preserved exactly and the full distance goes into receding.\n"
++                     "Outward only: never cuts into the model, so nothing behind the wall is ever "
++                     "left under-filled; the matching layer stands proud instead. Outer "
++                     "dimensions grow by up to the full distance.\n"
++                     "Only used when 'Offset outer wall surface' is on.");
++    def->enum_keys_map = &ConfigOptionEnum<ImageMapWallOffsetDirection>::get_enum_values();
++    def->enum_values.push_back("both");
++    def->enum_values.push_back("inward");
++    def->enum_values.push_back("outward");
++    def->enum_labels.push_back(L("In and out"));
++    def->enum_labels.push_back(L("Inward only"));
++    def->enum_labels.push_back(L("Outward only"));
++    def->mode = comDevelop;
++    def->set_default_value(new ConfigOptionEnum<ImageMapWallOffsetDirection>(ImageMapWallOffsetDirection::Both));
++
++    // -----------------------------------------------------------------------
++    // Wall map, toggle 3: both halves at once, at fixed settings.
++    // -----------------------------------------------------------------------
++    def = this->add("image_map_wall_combined_preset", coBool);
++    def->label = L("Combined (preset)");
++    def->category = L("Multimaterial");
++    def->tooltip = L("Run both effects together at fixed, non-adjustable settings, and ignore the "
++                     "two toggles above and all of their settings. The surface-travel budget (the "
++                     "nozzle diameter, at most 0.35 mm) is split evenly: the line width sweeps "
++                     "half of it about the nominal width, and the wall is offset symmetrically by "
++                     "the other half, for the strongest color effect the feature can produce "
++                     "while staying printable. Loops that cannot take a width change (bridges and "
++                     "overhangs) are still offset, so the surface stays uniform.");
 +    def->mode = comDevelop;
 +    def->set_default_value(new ConfigOptionBool(false));
 +
      def = this->add("enable_prime_tower", coBool);
      def->label = L("Enable");
      def->tooltip = L("The wiping tower can be used to clean up the residue on the nozzle and stabilize the chamber pressure inside the nozzle, "
+@@ -7234,7 +7419,16 @@ void PrintConfigDef::init_sla_params()
+ void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &value)
+ {
+     //BBS: handle legacy options
+-    if (opt_key == "enable_wipe_tower") {
++    if (opt_key == "image_map_outer_wall_mode" || opt_key == "image_map_wall_offset_inward_only") {
++        // The image-map wall map's single three-valued mode was split into
++        // independent toggles (image_map_wall_width_enable /
++        // image_map_wall_offset_enable / image_map_wall_combined_preset), which
++        // one key cannot be rewritten into. Drop the old keys so projects saved
++        // by an earlier build of this port still load, picking up the new
++        // defaults (surface offset on, width modulation off) rather than
++        // failing to parse.
++        opt_key = "";
++    } else if (opt_key == "enable_wipe_tower") {
+         opt_key = "enable_prime_tower";
+     } else if (opt_key == "wipe_tower_width") {
+         opt_key = "prime_tower_width";
 diff --git a/src/libslic3r/PrintConfig.hpp b/src/libslic3r/PrintConfig.hpp
-index 0f1319c..3aea912 100644
+index 0f1319c..ae2a276 100644
 --- a/src/libslic3r/PrintConfig.hpp
 +++ b/src/libslic3r/PrintConfig.hpp
-@@ -1514,6 +1514,17 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
+@@ -70,6 +70,14 @@ enum class NoiseType {
+     Voronoi,
+ };
+ 
++// Image-map wall map: which way the "offset the wall's surface" toggle is
++// allowed to move the outer wall. Mirrors ImageMapPerLayer::WallOffsetDirection.
++enum class ImageMapWallOffsetDirection {
++    Both,
++    Inward,
++    Outward,
++};
++
+ enum class FuzzySkinMode {
+     Displacement,
+     Extrusion,
+@@ -523,6 +531,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PrinterTechnology)
+ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(GCodeFlavor)
+ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinType)
+ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(NoiseType)
++CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ImageMapWallOffsetDirection)
+ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinMode)
+ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(InfillPattern)
+ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(IroningType)
+@@ -1514,6 +1523,23 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
      ((ConfigOptionInts,               nozzle_temperature_range_high))
      ((ConfigOptionFloatsNullable,     wipe_distance))
      ((ConfigOptionBool,               enable_mixed_color_sublayer))
 +    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap); default off.
 +    ((ConfigOptionBool,               image_map_per_layer_color_rotation))
++    // Wall map, toggle 1: modulate the outer wall's line width, + its settings.
++    ((ConfigOptionBool,               image_map_wall_width_enable))
++    ((ConfigOptionBool,               image_map_wall_width_allow_widening))
 +    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_global_strength))
 +    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_max_line_width))
 +    ((ConfigOptionFloat,              texture_mapping_outer_wall_gradient_min_line_width))
++    // Wall map, toggle 2: offset the outer wall's surface, + its settings.
++    ((ConfigOptionBool,               image_map_wall_offset_enable))
++    ((ConfigOptionFloat,              image_map_wall_offset_distance))
++    ((ConfigOptionEnum<ImageMapWallOffsetDirection>, image_map_wall_offset_direction))
++    // Wall map, toggle 3: both of the above at fixed, non-editable settings.
++    ((ConfigOptionBool,               image_map_wall_combined_preset))
 +    ((ConfigOptionInt,                image_map_generic_solver_lookup_mode))
 +    ((ConfigOptionInt,                image_map_generic_solver_mode))
 +    ((ConfigOptionInt,                image_map_generic_solver_mix_model))
-+    ((ConfigOptionInt,                image_map_outer_wall_mode))
-+    ((ConfigOptionFloat,              image_map_wall_offset_distance))
-+    ((ConfigOptionBool,               image_map_wall_offset_inward_only))
      ((ConfigOptionBool,               enable_prime_tower))
      ((ConfigOptionBool,               prime_tower_enable_framework))
      // BBS: change wipe_tower_x and wipe_tower_y data type to floats to add partplate logic

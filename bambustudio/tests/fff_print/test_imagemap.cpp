@@ -106,31 +106,64 @@ TEST_CASE("imagemap: rotation set is empty when fewer than 2 filaments are used"
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: outer-wall surface offsetting.
+// The wall map: the two composable halves (line-width modulation and surface
+// offsetting) and the fixed "combined" preset that runs both.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-using Slic3r::ImageMapPerLayer::OuterWallMode;
 using Slic3r::ImageMapPerLayer::WallModulation;
+using Slic3r::ImageMapPerLayer::WallModulationSettings;
+using Slic3r::ImageMapPerLayer::WallOffsetDirection;
 
 constexpr float kNominal     = 0.42f;
 constexpr float kMinWidth    = 0.32f;
 constexpr float kMaxWidth    = 0.95f;
 constexpr float kLayerHeight = 0.20f;
 constexpr float kNozzle      = 0.40f;
+constexpr float kCap         = 0.35f;   // max_surface_offset_mm(0.4)
 
-WallModulation modulate(float weight, OuterWallMode mode, float strength = 100.f)
+WallModulationSettings base_settings()
 {
-    return Slic3r::ImageMapPerLayer::compute_wall_modulation(
-        weight, kNominal, kMinWidth, kMaxWidth, strength, kLayerHeight, kNozzle, mode);
+    WallModulationSettings s;
+    s.config_min_width_mm = kMinWidth;
+    s.config_max_width_mm = kMaxWidth;
+    s.width_strength_pct  = 100.f;
+    s.offset_distance_mm  = 0.15f;
+    s.layer_height_mm     = kLayerHeight;
+    s.nozzle_diameter_mm  = kNozzle;
+    return s;
 }
 
-WallModulation offset_only(float weight, float distance, bool inward_only, float strength = 100.f)
+// Toggle 1 only: vary the line width.
+WallModulation width_only(float weight, bool allow_widening, float strength = 100.f,
+                          float min_width = kMinWidth, float max_width = kMaxWidth)
+{
+    WallModulationSettings s = base_settings();
+    s.modulate_width      = true;
+    s.allow_widening      = allow_widening;
+    s.width_strength_pct  = strength;
+    s.config_min_width_mm = min_width;
+    s.config_max_width_mm = max_width;
+    return Slic3r::ImageMapPerLayer::compute_wall_modulation(weight, kNominal, s);
+}
+
+// Toggle 2 only: move the surface.
+WallModulation offset_only(float weight, float distance, WallOffsetDirection direction)
+{
+    WallModulationSettings s = base_settings();
+    s.offset_surface     = true;
+    s.offset_distance_mm = distance;
+    s.offset_direction   = direction;
+    return Slic3r::ImageMapPerLayer::compute_wall_modulation(weight, kNominal, s);
+}
+
+// Toggle 3: the fixed preset.
+WallModulation combined(float weight)
 {
     return Slic3r::ImageMapPerLayer::compute_wall_modulation(
-        weight, kNominal, kMinWidth, kMaxWidth, strength, kLayerHeight, kNozzle,
-        OuterWallMode::OffsetOnly, distance, inward_only);
+        weight, kNominal,
+        Slic3r::ImageMapPerLayer::combined_preset_settings(kNominal, kLayerHeight, kNozzle));
 }
 
 // Where the wall's inner edge ends up, relative to the nominal inner edge.
@@ -143,15 +176,32 @@ float inner_edge_error(const WallModulation &m)
 
 } // namespace
 
-TEST_CASE("imagemap: Inward mode only ever recedes, and never moves the wall's inner edge", "[ImageMapPerLayerColor]")
+TEST_CASE("imagemap: all three toggles off is an exact no-op", "[ImageMapPerLayerColor]")
+{
+    // The wall map's entry point is reached whenever the master rotation toggle
+    // is on, even with every wall-map toggle off. That state must modulate
+    // nothing at all -- tool-change collapsing without any geometry change.
+    WallModulationSettings s = base_settings();
+    REQUIRE(!s.any_effect());
+    for (int i = 0; i <= 4; ++i) {
+        const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(float(i) / 4.f, kNominal, s);
+        REQUIRE(!m.active);
+        REQUIRE(!m.width_changed);
+        REQUIRE(!m.ring_moves);
+    }
+}
+
+TEST_CASE("imagemap: width toggle, narrow-only never grows and never moves the inner edge", "[ImageMapPerLayerColor]")
 {
     // weight 1 == the active filament matches the painted target: full width,
     // no shift, nothing to do.
-    const WallModulation full = modulate(1.f, OuterWallMode::Inward);
+    const WallModulation full = width_only(1.f, /*allow_widening=*/false);
     REQUIRE(!full.active);
 
-    const WallModulation none = modulate(0.f, OuterWallMode::Inward);
+    const WallModulation none = width_only(0.f, /*allow_widening=*/false);
     REQUIRE(none.active);
+    REQUIRE(none.width_changed);
+    REQUIRE(none.ring_moves);
     // Narrowed to the configured minimum...
     REQUIRE(none.width_mm == Approx(kMinWidth).margin(1e-4));
     // ...with the surface pulled in by the *full* width loss, not half of it.
@@ -166,7 +216,7 @@ TEST_CASE("imagemap: Inward mode only ever recedes, and never moves the wall's i
     // Monotone in the weight, and never wider than nominal.
     float previous = -1e9f;
     for (int i = 0; i <= 10; ++i) {
-        const WallModulation m = modulate(float(i) / 10.f, OuterWallMode::Inward);
+        const WallModulation m = width_only(float(i) / 10.f, /*allow_widening=*/false);
         REQUIRE(m.width_mm >= previous);
         REQUIRE(m.width_mm <= kNominal + 1e-4f);
         REQUIRE(inner_edge_error(m) == Approx(0.).margin(1e-4));
@@ -174,14 +224,13 @@ TEST_CASE("imagemap: Inward mode only ever recedes, and never moves the wall's i
     }
 }
 
-TEST_CASE("imagemap: Centered mode swings the surface both outward and inward", "[ImageMapPerLayerColor]")
+TEST_CASE("imagemap: width toggle, 'allow widening' swings the surface both ways", "[ImageMapPerLayerColor]")
 {
-    const WallModulation full = modulate(1.f, OuterWallMode::Centered);
-    const WallModulation none = modulate(0.f, OuterWallMode::Centered);
+    const WallModulation full = width_only(1.f, /*allow_widening=*/true);
+    const WallModulation none = width_only(0.f, /*allow_widening=*/true);
 
     REQUIRE(full.active);
     REQUIRE(none.active);
-    // This is the Phase 2 point: the surface can now go *out* as well as in.
     REQUIRE(full.surface_offset_mm > 0.f);
     REQUIRE(none.surface_offset_mm < 0.f);
     // Widening means the centerline shifts away from the material.
@@ -195,72 +244,103 @@ TEST_CASE("imagemap: Centered mode swings the surface both outward and inward", 
     REQUIRE(inner_edge_error(full) == Approx(0.).margin(1e-4));
     REQUIRE(inner_edge_error(none) == Approx(0.).margin(1e-4));
 
-    // Strictly more colour range than Inward mode.
-    const WallModulation inward_none = modulate(0.f, OuterWallMode::Inward);
-    const float centered_range = full.surface_offset_mm - none.surface_offset_mm;
-    const float inward_range   = 0.f - inward_none.surface_offset_mm;
-    REQUIRE(centered_range > inward_range);
+    // Strictly more colour range than narrow-only.
+    const WallModulation narrow_none = width_only(0.f, /*allow_widening=*/false);
+    const float widening_range = full.surface_offset_mm - none.surface_offset_mm;
+    const float narrow_range   = 0.f - narrow_none.surface_offset_mm;
+    REQUIRE(widening_range > narrow_range);
 }
 
 TEST_CASE("imagemap: surface movement is capped at the nozzle-derived limit", "[ImageMapPerLayerColor]")
 {
     // Port of TextureMappingManager::max_component_surface_offset_mm().
-    REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(0.40f) == Approx(0.35f));
+    REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(0.40f) == Approx(kCap));
     REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(0.20f) == Approx(0.20f));
-    REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(1.00f) == Approx(0.35f));
+    REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(1.00f) == Approx(kCap));
 
-    // An absurd configured max must not translate into an absurd excursion.
+    // An absurd configured max must not translate into an absurd excursion,
+    // in any combination of the two halves.
     for (int i = 0; i <= 10; ++i) {
-        const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(
-            float(i) / 10.f, kNominal, 0.05f, 3.0f, 100.f, kLayerHeight, kNozzle, OuterWallMode::Centered);
-        REQUIRE(std::abs(m.surface_offset_mm) <= 0.35f + 1e-3f);
+        const float w = float(i) / 10.f;
+        REQUIRE(std::abs(width_only(w, true, 100.f, 0.05f, 3.0f).surface_offset_mm) <= kCap + 1e-3f);
+        REQUIRE(std::abs(offset_only(w, 10.0f, WallOffsetDirection::Both).surface_offset_mm) <= kCap + 1e-3f);
+        REQUIRE(std::abs(offset_only(w, 10.0f, WallOffsetDirection::Inward).surface_offset_mm) <= kCap + 1e-3f);
+        REQUIRE(std::abs(offset_only(w, 10.0f, WallOffsetDirection::Outward).surface_offset_mm) <= kCap + 1e-3f);
+        REQUIRE(std::abs(combined(w).surface_offset_mm) <= kCap + 1e-3f);
+
+        // ...and neither does asking both halves at once for far too much.
+        WallModulationSettings s = base_settings();
+        s.modulate_width      = true;
+        s.allow_widening      = true;
+        s.config_min_width_mm = 0.05f;
+        s.config_max_width_mm = 3.0f;
+        s.offset_surface      = true;
+        s.offset_distance_mm  = 10.0f;
+        const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(w, kNominal, s);
+        REQUIRE(std::abs(m.surface_offset_mm) <= kCap + 1e-3f);
     }
 }
 
-TEST_CASE("imagemap: zero strength is an exact no-op in every mode", "[ImageMapPerLayerColor]")
+TEST_CASE("imagemap: zero strength disables the width half without disabling the offset half", "[ImageMapPerLayerColor]")
 {
-    for (OuterWallMode mode : {OuterWallMode::Inward, OuterWallMode::Centered}) {
-        for (int i = 0; i <= 4; ++i) {
-            const WallModulation m = modulate(float(i) / 4.f, mode, 0.f);
-            REQUIRE(!m.active);
-        }
-    }
+    for (bool allow_widening : {false, true})
+        for (int i = 0; i <= 4; ++i)
+            REQUIRE(!width_only(float(i) / 4.f, allow_widening, 0.f).active);
+
+    // The strength setting belongs to the width half only: zeroing it must not
+    // reach across and kill an independently enabled surface offset.
+    WallModulationSettings s = base_settings();
+    s.modulate_width     = true;
+    s.width_strength_pct = 0.f;
+    s.offset_surface     = true;
+    s.offset_distance_mm = 0.15f;
+    const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, kNominal, s);
+    REQUIRE(m.active);
+    REQUIRE(!m.width_changed);
+    REQUIRE(m.width_mm == Approx(kNominal));
+    REQUIRE(m.flow_scale == Approx(1.0));
+    REQUIRE(m.surface_offset_mm == Approx(-0.5f * 0.15f).margin(1e-4));
+
+    // A zero offset distance is likewise a no-op for the offset half.
     for (int i = 0; i <= 4; ++i)
-        REQUIRE(!offset_only(float(i) / 4.f, 0.15f, false, 0.f).active);
+        REQUIRE(!offset_only(float(i) / 4.f, 0.f, WallOffsetDirection::Both).active);
 }
 
 // This is the regression that produced the voids on a real Benchy: the project
 // had texture_mapping_outer_wall_gradient_min_line_width cranked to its 0.05 mm
-// floor, and the width-modulating modes honoured it literally, asking for
-// ~0.07 mm external perimeters on a 0.4 mm nozzle. Those do not extrude.
-TEST_CASE("imagemap: width-modulating modes never request an unextrudable line", "[ImageMapPerLayerColor]")
+// floor, and the width half honoured it literally, asking for ~0.07 mm external
+// perimeters on a 0.4 mm nozzle. Those do not extrude.
+TEST_CASE("imagemap: the width half never requests an unextrudable line", "[ImageMapPerLayerColor]")
 {
     REQUIRE(Slic3r::ImageMapPerLayer::min_printable_width_mm(0.40f) == Approx(0.20f));
     REQUIRE(Slic3r::ImageMapPerLayer::min_printable_width_mm(0.20f) == Approx(0.10f));
     REQUIRE(Slic3r::ImageMapPerLayer::min_printable_width_mm(0.06f) == Approx(0.05f)); // 0.05 mm floor
 
-    for (OuterWallMode mode : {OuterWallMode::Inward, OuterWallMode::Centered}) {
+    const float floor_mm = Slic3r::ImageMapPerLayer::min_printable_width_mm(kNozzle);
+    for (bool allow_widening : {false, true})
         for (int i = 0; i <= 10; ++i) {
             // The exact configuration off the failing Benchy project: min 0.05,
             // max 3.0, full strength.
-            const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(
-                float(i) / 10.f, kNominal, 0.05f, 3.0f, 100.f, kLayerHeight, kNozzle, mode);
-            REQUIRE(m.width_mm >= Slic3r::ImageMapPerLayer::min_printable_width_mm(kNozzle) - 1e-4f);
+            const WallModulation m = width_only(float(i) / 10.f, allow_widening, 100.f, 0.05f, 3.0f);
+            REQUIRE(m.width_mm >= floor_mm - 1e-4f);
         }
-    }
+    for (int i = 0; i <= 10; ++i)
+        REQUIRE(combined(float(i) / 10.f).width_mm >= floor_mm - 1e-4f);
 }
 
-TEST_CASE("imagemap: OffsetOnly moves the wall without touching width or flow", "[ImageMapPerLayerColor]")
+TEST_CASE("imagemap: offset toggle moves the wall without touching width or flow", "[ImageMapPerLayerColor]")
 {
     const float d = 0.15f;
 
-    // Centered: symmetric swing, and width/flow are left strictly alone.
-    const WallModulation full = offset_only(1.f, d, false);
-    const WallModulation none = offset_only(0.f, d, false);
-    const WallModulation mid  = offset_only(0.5f, d, false);
+    // "In and out": symmetric swing, width/flow left strictly alone.
+    const WallModulation full = offset_only(1.f, d, WallOffsetDirection::Both);
+    const WallModulation none = offset_only(0.f, d, WallOffsetDirection::Both);
+    const WallModulation mid  = offset_only(0.5f, d, WallOffsetDirection::Both);
 
     REQUIRE(full.width_mm == Approx(kNominal));
     REQUIRE(none.width_mm == Approx(kNominal));
+    REQUIRE(!full.width_changed);
+    REQUIRE(!none.width_changed);
     REQUIRE(full.flow_scale == Approx(1.0));
     REQUIRE(none.flow_scale == Approx(1.0));
 
@@ -273,34 +353,127 @@ TEST_CASE("imagemap: OffsetOnly moves the wall without touching width or flow", 
     REQUIRE(full.centerline_shift_mm == Approx(-full.surface_offset_mm).margin(1e-6));
     REQUIRE(none.centerline_shift_mm == Approx(-none.surface_offset_mm).margin(1e-6));
 
-    // Inward-only: never grows the part, and spends the whole distance inward.
-    const WallModulation in_full = offset_only(1.f, d, true);
-    const WallModulation in_none = offset_only(0.f, d, true);
-    REQUIRE(!in_full.active);                       // weight 1 == nominal position
-    REQUIRE(in_none.surface_offset_mm == Approx(-d).margin(1e-4));
-    for (int i = 0; i <= 10; ++i)
-        REQUIRE(offset_only(float(i) / 10.f, d, true).surface_offset_mm <= 1e-4f);
+    // "Inward only": never grows the part, spends the whole distance receding.
+    REQUIRE(!offset_only(1.f, d, WallOffsetDirection::Inward).active);  // weight 1 == nominal position
+    REQUIRE(offset_only(0.f, d, WallOffsetDirection::Inward).surface_offset_mm == Approx(-d).margin(1e-4));
 
-    // Monotone in the weight, both variants.
-    for (bool inward_only : {false, true}) {
+    // "Outward only": never cuts into the model, stands proud on a match.
+    REQUIRE(!offset_only(0.f, d, WallOffsetDirection::Outward).active); // weight 0 == nominal position
+    REQUIRE(offset_only(1.f, d, WallOffsetDirection::Outward).surface_offset_mm == Approx(+d).margin(1e-4));
+
+    for (int i = 0; i <= 10; ++i) {
+        REQUIRE(offset_only(float(i) / 10.f, d, WallOffsetDirection::Inward).surface_offset_mm <= 1e-4f);
+        REQUIRE(offset_only(float(i) / 10.f, d, WallOffsetDirection::Outward).surface_offset_mm >= -1e-4f);
+    }
+
+    // Monotone in the weight, all three directions, width never touched.
+    for (WallOffsetDirection direction : {WallOffsetDirection::Both, WallOffsetDirection::Inward, WallOffsetDirection::Outward}) {
         float previous = -1e9f;
         for (int i = 0; i <= 10; ++i) {
-            const WallModulation m = offset_only(float(i) / 10.f, d, inward_only);
+            const WallModulation m = offset_only(float(i) / 10.f, d, direction);
             REQUIRE(m.surface_offset_mm >= previous);
             REQUIRE(m.width_mm == Approx(kNominal));
+            REQUIRE(!m.width_changed);
             previous = m.surface_offset_mm;
         }
     }
 }
 
-TEST_CASE("imagemap: OffsetOnly respects the surface-offset cap", "[ImageMapPerLayerColor]")
+TEST_CASE("imagemap: the two halves add up", "[ImageMapPerLayerColor]")
 {
-    // Ask for far more than the cap allows, in both variants and at both ends.
-    for (bool inward_only : {false, true})
-        for (int i = 0; i <= 10; ++i) {
-            const WallModulation m = offset_only(float(i) / 10.f, 10.0f, inward_only);
-            REQUIRE(std::abs(m.surface_offset_mm) <= 0.35f + 1e-3f);
-        }
+    const float narrowing = kNominal - kMinWidth;   // 0.10 mm, inside the cap
+    const float d         = 0.05f;
+
+    WallModulationSettings s = base_settings();
+    s.modulate_width      = true;
+    s.allow_widening      = false;
+    s.offset_surface      = true;
+    s.offset_distance_mm  = d;
+    s.offset_direction    = WallOffsetDirection::Outward;
+
+    // weight 0: the width bottoms out at the configured minimum (surface
+    // -narrowing) and the outward offset contributes nothing yet.
+    const WallModulation none = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, kNominal, s);
+    REQUIRE(none.active);
+    REQUIRE(none.width_mm == Approx(kMinWidth).margin(1e-4));
+    REQUIRE(none.surface_offset_mm == Approx(-narrowing).margin(1e-4));
+
+    // Halfway: the width has recovered half the narrowing (surface at
+    // -narrowing/2) and the outward offset adds +d/2 on top. The two really do
+    // add rather than one overriding the other.
+    const WallModulation mid = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.5f, kNominal, s);
+    REQUIRE(mid.width_mm == Approx(kNominal - 0.5f * narrowing).margin(1e-4));
+    REQUIRE(mid.surface_offset_mm == Approx(-0.5f * narrowing + 0.5f * d).margin(1e-4));
+    REQUIRE(mid.width_changed);
+    REQUIRE(mid.flow_scale < 1.0);
+}
+
+TEST_CASE("imagemap: a re-widthed loop whose ring does not move is still applied", "[ImageMapPerLayerColor]")
+{
+    // The two halves' *centerline* contributions can cancel exactly: the width
+    // half shifts the centerline in by half the width loss to pin the inner
+    // edge, and an outward offset of the same size shifts it back out. The ring
+    // then stays exactly where it was -- but the extrusion is genuinely
+    // narrower, so this is a real modulation, not a no-op. Reporting it as
+    // inactive (or making the caller's ring offset a precondition for applying
+    // the width) silently drops the width change on the floor.
+    //
+    // Narrow-only, min 0.32 on a 0.42 nominal, outward offset d = 0.05:
+    //   at weight 0.5, width = 0.37, shift_width = +0.025, offset = +0.025.
+    WallModulationSettings s = base_settings();
+    s.modulate_width      = true;
+    s.allow_widening      = false;
+    s.offset_surface      = true;
+    s.offset_distance_mm  = 0.05f;
+    s.offset_direction    = WallOffsetDirection::Outward;
+
+    const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.5f, kNominal, s);
+    REQUIRE(m.centerline_shift_mm == Approx(0.f).margin(1e-4));
+    REQUIRE(!m.ring_moves);        // nothing for offset_closed_ring() to do...
+    REQUIRE(m.width_changed);      // ...but the width still has to be written
+    REQUIRE(m.active);
+    REQUIRE(m.width_mm < kNominal - 1e-3f);
+    REQUIRE(m.flow_scale < 1.0);
+}
+
+TEST_CASE("imagemap: the combined preset runs both halves and beats either alone", "[ImageMapPerLayerColor]")
+{
+    const WallModulationSettings preset =
+        Slic3r::ImageMapPerLayer::combined_preset_settings(kNominal, kLayerHeight, kNozzle);
+    REQUIRE(preset.modulate_width);
+    REQUIRE(preset.allow_widening);
+    REQUIRE(preset.offset_surface);
+
+    const WallModulation full = combined(1.f);
+    const WallModulation none = combined(0.f);
+    REQUIRE(full.active);
+    REQUIRE(none.active);
+    REQUIRE(full.width_changed);
+    REQUIRE(none.width_changed);
+
+    // Full scale in both directions: the budget is the surface-travel cap.
+    REQUIRE(full.surface_offset_mm == Approx(+kCap).margin(1e-3));
+    REQUIRE(none.surface_offset_mm == Approx(-kCap).margin(1e-3));
+    REQUIRE(full.flow_scale > 1.0);
+    REQUIRE(none.flow_scale < 1.0);
+
+    // Strictly wider colour range than either half on its own at its default
+    // settings -- that is the whole point of the preset.
+    const float combined_range = full.surface_offset_mm - none.surface_offset_mm;
+    const float width_range    = width_only(1.f, true).surface_offset_mm - width_only(0.f, true).surface_offset_mm;
+    const float offset_range   = offset_only(1.f, 0.15f, WallOffsetDirection::Both).surface_offset_mm -
+                                 offset_only(0.f, 0.15f, WallOffsetDirection::Both).surface_offset_mm;
+    REQUIRE(combined_range > width_range);
+    REQUIRE(combined_range > offset_range);
+
+    // Monotone, and the preset ignores every user setting by construction: the
+    // same nominal/layer/nozzle triple always yields the same numbers.
+    float previous = -1e9f;
+    for (int i = 0; i <= 10; ++i) {
+        const WallModulation m = combined(float(i) / 10.f);
+        REQUIRE(m.surface_offset_mm >= previous - 1e-6f);
+        previous = m.surface_offset_mm;
+    }
 }
 
 TEST_CASE("imagemap: offset_closed_ring() miters a square inward and preserves vertices", "[ImageMapPerLayerColor]")
