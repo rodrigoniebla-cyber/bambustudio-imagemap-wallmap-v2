@@ -14,6 +14,7 @@
 #include "libslic3r.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -143,6 +144,43 @@ std::vector<unsigned int> rotation_filaments(const Print &print)
             rotation.insert(filament);
 
     return std::vector<unsigned int>(rotation.begin(), rotation.end());
+}
+
+std::vector<unsigned int> parse_component_filaments(const std::string &text, size_t num_filaments)
+{
+    std::vector<unsigned int> out;
+    size_t i = 0;
+    while (i < text.size()) {
+        if (!std::isdigit(static_cast<unsigned char>(text[i]))) {
+            // Skip a whole non-numeric token, so "F2" or "-1" contribute nothing
+            // rather than a stray "2" or "1".
+            if (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == ',' || text[i] == ';') {
+                ++i;
+            } else {
+                while (i < text.size() && !std::isspace(static_cast<unsigned char>(text[i])) && text[i] != ',' && text[i] != ';')
+                    ++i;
+            }
+            continue;
+        }
+        size_t j = i;
+        unsigned long long value = 0;
+        while (j < text.size() && std::isdigit(static_cast<unsigned char>(text[j]))) {
+            value = std::min<unsigned long long>(value * 10 + unsigned(text[j] - '0'), 1000000ull);
+            ++j;
+        }
+        const bool token_ends = j == text.size() || std::isspace(static_cast<unsigned char>(text[j])) || text[j] == ',' || text[j] == ';';
+        if (!token_ends) {
+            // "2x" and the like: not a filament number, drop the whole token.
+            while (j < text.size() && !std::isspace(static_cast<unsigned char>(text[j])) && text[j] != ',' && text[j] != ';')
+                ++j;
+        } else if (value >= 1 && value <= num_filaments) {
+            const unsigned int filament = unsigned(value - 1);
+            if (std::find(out.begin(), out.end(), filament) == out.end())
+                out.push_back(filament);
+        }
+        i = j;
+    }
+    return out;
 }
 
 std::vector<unsigned int> rotation_sequence(const std::vector<unsigned int> &rotation,
@@ -371,7 +409,14 @@ WallModulation compute_wall_modulation(float                         weight,
         const float config_max = settings.config_max_width_mm > 0.f ? settings.config_max_width_mm
                                                                     : nominal + cap;
 
-        float lo = std::max({config_min, hard_min, nominal - cap});
+        // The narrow end may take the surface in by up to 2 * cap: the paired
+        // centerline shift is half the width change, so that keeps the shift
+        // itself inside the cap. This is the origin's own bound,
+        // max_width_delta_limit_mm = min(effective_delta, 2 * max_allowed_distance)
+        // (origin GCode.cpp:11200), and it is what lets a wide outer wall (the
+        // origin's vertex-colour-match geometry, 0.95 mm on a 0.4 mm nozzle)
+        // recede by the origin's full 0.63 mm instead of stopping at 0.35 mm.
+        float lo = std::max({config_min, hard_min, nominal - 2.f * cap});
         float hi = nominal;
         if (settings.allow_widening) {
             // Widening is what buys the outward half of the swing. Cap it both
@@ -427,22 +472,30 @@ WallModulation compute_wall_modulation(float                         weight,
     }
 
     // -----------------------------------------------------------------------
-    // Compose. The width half is already inside the cap on its own; clamp the
-    // total and take any excess out of the offset half, which has no lower
-    // bound of its own to violate.
+    // Compose. The width half is already inside its bounds on its own; clamp
+    // the total and take any excess out of the offset half, which has no lower
+    // bound of its own to violate. Two bounds, both the origin's:
+    //  * the surface never moves out past nominal by more than cap, nor in by
+    //    more than 2 * cap (the narrowing limit above);
+    //  * the toolpath centerline never moves by more than cap. That is the
+    //    bound that keeps the wall where the feature promises -- it is also
+    //    the ceiling offset_closed_ring() is handed for the miter join.
     // -----------------------------------------------------------------------
     const float width_travel = width - nominal;
+    const float width_shift  = 0.5f * (nominal - width);   // pins the inner edge
     float surface_offset = width_travel + offset;
     if (!std::isfinite(surface_offset))
         return out;
-    surface_offset = std::clamp(surface_offset, -cap, cap);
+    surface_offset = std::clamp(surface_offset, -2.f * cap, cap);
     offset = surface_offset - width_travel;
+    offset = std::clamp(offset, width_shift - cap, width_shift + cap);
+    surface_offset = width_travel + offset;
 
     // Pin the wall's inner edge for the width half (shifting the centerline by
     // half the width change keeps (centerline - width/2) constant), then
     // translate the whole thing by the offset half. Positive shift = toward the
     // material = surface recedes.
-    const float shift = 0.5f * (nominal - width) - offset;
+    const float shift = width_shift - offset;
     if (!std::isfinite(shift))
         return out;
 

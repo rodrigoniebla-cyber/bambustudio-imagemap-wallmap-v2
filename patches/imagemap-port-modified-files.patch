@@ -37,7 +37,7 @@ index a432007..430387b 100644
      ZLIB::ZLIB
      ${OCCT_LIBS}
 diff --git a/src/libslic3r/GCode.cpp b/src/libslic3r/GCode.cpp
-index ac30594..6d8154e 100644
+index ac30594..fe77712 100644
 --- a/src/libslic3r/GCode.cpp
 +++ b/src/libslic3r/GCode.cpp
 @@ -1809,6 +1809,10 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
@@ -51,7 +51,39 @@ index ac30594..6d8154e 100644
      CNumericLocalesSetter locales_setter;
  
      // Does the file exist? If so, we hope that it is still valid.
-@@ -6173,6 +6177,13 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
+@@ -2605,7 +2609,19 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
+             throw Slic3r::SlicingError(_(L("No object can be printed. Maybe too small")));
+         // We don't allow switching of extruders per layer by Model::custom_gcode_per_print_z in sequential mode.
+         // Use the extruder IDs collected from Regions.
+-        this->set_extruders(print.extruders());
++        if (ImageMapPerLayer::enabled(print.config())) {
++            // Image-map per-layer color rotation remaps each layer onto one of
++            // the rotation filaments, which the regions never name (and may
++            // name filaments that are colour targets only, never printed).
++            // The writer must know every filament a layer can switch to, or
++            // set_extruder() dereferences a filament it was never given.
++            std::vector<unsigned int> extruders = print.extruders();
++            for (const auto &object_ordering : by_obj_print_data.object_tool_ordering_map)
++                append(extruders, object_ordering.second.all_extruders());
++            sort_remove_duplicates(extruders);
++            this->set_extruders(extruders);
++        } else
++            this->set_extruders(print.extruders());
+ 
+         has_wipe_tower = print.has_wipe_tower() && tool_ordering.has_wipe_tower();
+     } else {
+@@ -4580,6 +4596,10 @@ GCode::LayerResult GCode::process_layer(
+         layer_ptr = support_layer;
+     const Layer& layer = *layer_ptr;
+     m_cur_layer_idx = layer.id();
++    // Image-map per-layer color rotation: the wall map solves over the same
++    // rotation this layer's tool changes were collapsed to. Empty (and unused)
++    // when the feature is off.
++    m_image_map_layer_rotation = layer_tools.image_map_rotation;
+     GCode::LayerResult   result { {}, layer.id(), false, last_layer };
+     if (layer_tools.extruders.empty())
+         // Nothing to extrude.
+@@ -6173,6 +6193,13 @@ std::string GCode::extrude_loop(ExtrusionLoop loop, std::string description, dou
      // get a copy; don't modify the orientation of the original loop object otherwise
      // next copies (if any) would not detect the correct orientation
  
@@ -65,7 +97,7 @@ index ac30594..6d8154e 100644
      // extrude all loops ccw or cw according to config
      if (m_config.print_in_clockwise)
          bool was_clockwise = loop.make_clockwise();
-@@ -7090,6 +7101,229 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
+@@ -7090,6 +7117,244 @@ double GCode::calc_max_volumetric_speed(const double layer_height, const double
      return res;
  }
  
@@ -90,27 +122,39 @@ index ac30594..6d8154e 100644
 +void GCode::init_image_map_per_layer_color(const Print &print)
 +{
 +    m_image_map_modulation_enabled = false;
++    m_image_map_solvers.clear();
++    m_image_map_layer_rotation.clear();
 +    if (!ImageMapPerLayer::enabled(print.config()))
 +        return; // default OFF — strict no-op
 +    // With all three wall-map toggles off the feature still collapses tool
-+    // changes, but no wall is ever modulated, so there is nothing to solve --
-+    // skip building the solver (which decodes a 37 MB colour LUT).
++    // changes, but no wall is ever modulated, so there is nothing to solve.
 +    if (!print.config().image_map_wall_combined_preset.value &&
 +        !print.config().image_map_wall_width_enable.value &&
 +        !print.config().image_map_wall_offset_enable.value)
 +        return;
-+    // Read the rotation set ToolOrdering already computed (Print::process()
-+    // runs before do_export(), so print.tool_ordering() is populated by now)
-+    // instead of independently recomputing it here: ToolOrdering derives the
-+    // set from real per-layer extruder usage, not just Print-level config, so
-+    // recomputing separately risked silently disagreeing with (or being more
-+    // permissive than) the tool-change collapsing this modulation must track.
-+    const std::vector<unsigned int> &rotation = print.tool_ordering().image_map_rotation_filaments();
-+    if (rotation.size() < 2)
-+        return;
-+    if (!m_image_map_solver.init(print.config(), rotation))
-+        return;
++    // The rotation itself is not read here: it is taken per layer from
++    // LayerTools::image_map_rotation in process_layer(). That is the set
++    // ToolOrdering actually collapsed the layer's tool changes to, so the two
++    // halves of the feature can never disagree -- and it is the only source
++    // that exists for a by-object print, where every object has its own
++    // ToolOrdering and print.tool_ordering() is empty. (Reading the latter left
++    // by-object prints with collapsed tool changes and no wall map at all:
++    // plain horizontal stripes of filament colour.)
 +    m_image_map_modulation_enabled = true;
++}
++
++ImageMapPerLayer::Solver *GCode::image_map_solver_for_layer()
++{
++    if (m_image_map_layer_rotation.size() < 2 || m_curr_print == nullptr)
++        return nullptr;
++    auto it = m_image_map_solvers.find(m_image_map_layer_rotation);
++    if (it == m_image_map_solvers.end()) {
++        it = m_image_map_solvers.emplace(m_image_map_layer_rotation, ImageMapPerLayer::Solver()).first;
++        // A failed init leaves the solver invalid; it is kept so the failure is
++        // not retried on every loop of every layer.
++        it->second.init(m_curr_print->config(), m_image_map_layer_rotation);
++    }
++    return it->second.valid() ? &it->second : nullptr;
 +}
 +
 +static ImageMapPerLayer::WallOffsetDirection image_map_offset_direction(ImageMapWallOffsetDirection value)
@@ -198,8 +242,11 @@ index ac30594..6d8154e 100644
 +    const int target_filament = m_config.wall_filament.value - 1;
 +    if (target_filament < 0)
 +        return false;
++    ImageMapPerLayer::Solver *solver = this->image_map_solver_for_layer();
++    if (solver == nullptr)
++        return false;
 +    const unsigned int active_filament = m_writer.filament()->id();
-+    const float weight = m_image_map_solver.weight_for(unsigned(target_filament), active_filament);
++    const float weight = solver->weight_for(unsigned(target_filament), active_filament);
 +    if (weight < 0.f)
 +        return false; // active or target filament outside the rotation set
 +
@@ -296,7 +343,7 @@ index ac30594..6d8154e 100644
  {
      std::string gcode;
 diff --git a/src/libslic3r/GCode.hpp b/src/libslic3r/GCode.hpp
-index 5d20282..be06f23 100644
+index 5d20282..7aae779 100644
 --- a/src/libslic3r/GCode.hpp
 +++ b/src/libslic3r/GCode.hpp
 @@ -20,6 +20,7 @@
@@ -307,17 +354,22 @@ index 5d20282..be06f23 100644
  
  #include <cfloat>
  #include <memory>
-@@ -651,6 +652,9 @@ private:
+@@ -651,6 +652,14 @@ private:
  
      // BBS
      Print* m_curr_print = nullptr;
 +    // Image-map per-layer color rotation state (empty/disabled by default).
 +    bool m_image_map_modulation_enabled = false;
-+    ImageMapPerLayer::Solver m_image_map_solver;
++    // One solver per rotation set, built on first use. By-layer prints have a
++    // single rotation; by-object prints have one ToolOrdering, and so possibly
++    // one rotation, per object.
++    std::map<std::vector<unsigned int>, ImageMapPerLayer::Solver> m_image_map_solvers;
++    // The rotation of the layer being processed (LayerTools::image_map_rotation).
++    std::vector<unsigned int> m_image_map_layer_rotation;
      unsigned int m_toolchange_count;
      std::vector<unsigned int> m_filament_change_sequence;
      std::vector<unsigned int> m_nozzle_change_sequence;
-@@ -674,6 +678,17 @@ private:
+@@ -674,6 +683,20 @@ private:
  
      double calc_max_volumetric_speed(const double layer_height, const double line_width, const std::string co_str);
      std::string _extrude(const ExtrusionPath &path, std::string description = "", double speed = -1, bool set_holes_and_compensation_speed = false, bool is_first_slope = false);
@@ -325,6 +377,9 @@ index 5d20282..be06f23 100644
 +    // initialize per-print modulation state; strict no-op when the
 +    // image_map_per_layer_color_rotation toggle (default off) is disabled.
 +    void init_image_map_per_layer_color(const Print &print);
++    // The solver for the current layer's rotation (built on first use), or
++    // nullptr when the layer has no rotation or its colours cannot be solved.
++    ImageMapPerLayer::Solver *image_map_solver_for_layer();
 +    // Re-widths an external perimeter loop for the current layer's active
 +    // filament and offsets its centerline so the wall's outer surface moves to
 +    // the colour-correct position, keeping the inner edge where the perimeter
@@ -336,7 +391,7 @@ index 5d20282..be06f23 100644
      void split_and_mapping_speed(double other_path_v, double final_v, ExtrusionPaths &this_path, double max_smooth_length, ExtrusionPaths &interpolated_paths, bool split_from_left = true);
      bool is_enable_overhang_speed();
 diff --git a/src/libslic3r/GCode/ToolOrdering.cpp b/src/libslic3r/GCode/ToolOrdering.cpp
-index 9d429b0..4152af4 100644
+index 9d429b0..cae1512 100644
 --- a/src/libslic3r/GCode/ToolOrdering.cpp
 +++ b/src/libslic3r/GCode/ToolOrdering.cpp
 @@ -10,6 +10,7 @@
@@ -397,7 +452,7 @@ index 9d429b0..4152af4 100644
      reorder_extruders_for_minimum_flush_volume(reorder_first_layer);
      this->enforce_mixed_component_order();
      m_sorted = true;
-@@ -2625,6 +2628,116 @@ void ToolOrdering::resolve_mixed_filaments(const PrintConfig &config)
+@@ -2625,6 +2628,151 @@ void ToolOrdering::resolve_mixed_filaments(const PrintConfig &config)
      }
  }
  
@@ -457,15 +512,44 @@ index 9d429b0..4152af4 100644
 +    // deriving from ModelVolume::get_extruders() paint data can under-include
 +    // a color that's genuinely extruded on every single layer. m_layer_tools
 +    // is the ground truth: it's literally what feeds the resulting G-code.
-+    std::set<unsigned int> rotation_set;
++    // Every non-support filament the layers actually extrude: this is what gets
++    // collapsed onto the layer's active filament.
++    std::set<unsigned int> body_filaments;
 +    for (const LayerTools &lt : m_layer_tools)
 +        for (unsigned int ext : lt.extruders)
 +            if (protected_filaments.count(ext) == 0)
-+                rotation_set.insert(ext);
++                body_filaments.insert(ext);
 +
-+    const std::vector<unsigned int> rotation(rotation_set.begin(), rotation_set.end());
++    // The rotation: which physical filaments the layers cycle through.
++    //
++    // With image_map_component_filaments set, it is that explicit list, in the
++    // user's order -- the origin's TextureMappingZone component list. Any other
++    // painted filament is then a *colour target only*: it is never loaded, its
++    // regions are printed with the layer's active component, and GCode solves
++    // its colour over the components. That is what lets a model painted in
++    // colours that are not in the AMS (orange, a skin tone, ...) be printed from
++    // e.g. C/M/Y/K/W, which is the whole point of the origin's technique.
++    //
++    // Left empty, the rotation is derived from what the layers actually extrude
++    // (m_layer_tools[*].extruders, already populated and 0-based at this point)
++    // rather than from Print-level config/region/volume-paint heuristics: those
++    // were found to disagree with reality in both directions on real projects
++    // -- enumerating every declared filament *slot* over-includes ones that are
++    // configured but never used (e.g. an unrelated virtual/mixed AMS slot
++    // elsewhere in the project), while deriving from ModelVolume::get_extruders()
++    // paint data can under-include a colour that's genuinely extruded on every
++    // single layer. m_layer_tools is the ground truth: it's literally what feeds
++    // the resulting G-code. Every painted filament is then both a component and
++    // a target, so each region reads as its own filament.
++    std::vector<unsigned int> rotation;
++    for (unsigned int filament : ImageMapPerLayer::parse_component_filaments(config.image_map_component_filaments.value, num_filaments))
++        if (protected_filaments.count(filament) == 0)
++            rotation.push_back(filament);
++    if (rotation.size() < 2)
++        rotation.assign(body_filaments.begin(), body_filaments.end());
 +    if (rotation.size() < 2)
 +        return;
++
 +    // Conservative: never combine with the mixed-filament (virtual slot)
 +    // feature for filaments that are actually part of the rotation set — the
 +    // two per-layer remaps would interact in untested ways. A virtual/mixed
@@ -477,6 +561,11 @@ index 9d429b0..4152af4 100644
 +        if (filament < is_mixed.size() && is_mixed[filament])
 +            return;
 +
++    // Everything that is remapped: the body filaments the layers use, plus the
++    // components themselves (a component may only appear through the remap).
++    std::set<unsigned int> remapped(body_filaments.begin(), body_filaments.end());
++    remapped.insert(rotation.begin(), rotation.end());
++
 +    const std::vector<unsigned int> sequence = ImageMapPerLayer::rotation_sequence(rotation);
 +    if (sequence.empty())
 +        return;
@@ -484,17 +573,18 @@ index 9d429b0..4152af4 100644
 +    for (LayerTools &lt : m_layer_tools) {
 +        const size_t layer_idx = size_t(&lt - m_layer_tools.data());
 +        const unsigned int active = ImageMapPerLayer::active_filament_for_layer(sequence, int(layer_idx));
-+        // Map every rotation filament on every layer so LayerTools::extruder()
++        // Map every remapped filament on every layer so LayerTools::extruder()
 +        // can never hand out a body filament that was removed from
 +        // lt.extruders below (which would silently drop extrusions).
-+        for (unsigned int filament : rotation)
++        for (unsigned int filament : remapped)
 +            lt.image_map_filament_resolution[filament] = active;
++        lt.image_map_rotation = rotation;
 +
 +        bool any_replaced = false;
 +        std::vector<unsigned int> new_extruders;
 +        new_extruders.reserve(lt.extruders.size());
 +        for (unsigned int ext : lt.extruders) {
-+            if (rotation_set.count(ext)) {
++            if (remapped.count(ext)) {
 +                new_extruders.push_back(active);
 +                any_replaced = true;
 +            } else {
@@ -515,10 +605,10 @@ index 9d429b0..4152af4 100644
  {
      for (LayerTools &lt : m_layer_tools) {
 diff --git a/src/libslic3r/GCode/ToolOrdering.hpp b/src/libslic3r/GCode/ToolOrdering.hpp
-index 8735207..43f9d60 100644
+index 8735207..6cd9801 100644
 --- a/src/libslic3r/GCode/ToolOrdering.hpp
 +++ b/src/libslic3r/GCode/ToolOrdering.hpp
-@@ -211,6 +211,19 @@ public:
+@@ -211,6 +211,25 @@ public:
          return (it != mixed_filament_resolution.end()) ? it->second : filament_0based;
      }
  
@@ -529,6 +619,12 @@ index 8735207..43f9d60 100644
 +    // only when image_map_per_layer_color_rotation is enabled; otherwise the map
 +    // stays empty and resolve_image_map() is the identity (strict no-op).
 +    std::map<unsigned int, unsigned int> image_map_filament_resolution;
++    // The 0-based physical filaments this layer's rotation cycles through (the
++    // origin's zone components), in rotation order. Empty when the feature is off.
++    // GCode reads it per layer to solve the wall map over the same set the tool
++    // changes were collapsed to, which also keeps by-object prints (one
++    // ToolOrdering per object) consistent.
++    std::vector<unsigned int>            image_map_rotation;
 +
 +    unsigned int resolve_image_map(unsigned int filament_0based) const {
 +        auto it = image_map_filament_resolution.find(filament_0based);
@@ -538,18 +634,18 @@ index 8735207..43f9d60 100644
      struct MixedSubLayerGroup {
          unsigned int              mixed_slot_0based;
          std::vector<unsigned int> components_0based;
-@@ -321,6 +334,10 @@ public:
+@@ -321,6 +340,10 @@ public:
      // resolve_mixed_filaments() expanded them to physical components. Empty when unused.
      const std::vector<unsigned int>& used_mixed_filaments() const { return m_used_mixed_filaments; }
  
-+    // Image-map per-layer color rotation set (0-based, sorted). Empty unless the
-+    // image_map_per_layer_color_rotation feature is enabled and applicable.
++    // Image-map per-layer color rotation set (0-based, in rotation order). Empty
++    // unless the image_map_per_layer_color_rotation feature is enabled and applicable.
 +    const std::vector<unsigned int>& image_map_rotation_filaments() const { return m_image_map_rotation; }
 +
      // Find LayerTools with the closest print_z.
      const LayerTools&	tools_for_layer(coordf_t print_z) const;
      LayerTools&			tools_for_layer(coordf_t print_z) { return const_cast<LayerTools&>(std::as_const(*this).tools_for_layer(print_z)); }
-@@ -408,6 +425,10 @@ private:
+@@ -408,6 +431,10 @@ private:
      void                reorder_extruders_for_minimum_flush_volume(bool reorder_first_layer);
      void                resolve_mixed_filaments(const PrintConfig &config);
      void                enforce_mixed_component_order();
@@ -560,19 +656,19 @@ index 8735207..43f9d60 100644
  
      // BBS
      std::vector<unsigned int> generate_first_layer_tool_order(const Print& print);
-@@ -429,6 +450,10 @@ private:
+@@ -429,6 +456,10 @@ private:
      // 0-based mixed slots actually present in any LayerTools::extruders before resolution.
      std::vector<unsigned int> m_used_mixed_filaments;
  
-+    // Image-map per-layer color rotation: the sorted 0-based body filament set the
-+    // print cycles through. Empty unless image_map_per_layer_color_rotation is on.
++    // Image-map per-layer color rotation: the 0-based body filament set the print
++    // cycles through, in rotation order. Empty unless image_map_per_layer_color_rotation is on.
 +    std::vector<unsigned int> m_image_map_rotation;
 +
      // All layer indices (in m_layer_tools) where each object has any layer.
      // Used by gradient run detection to distinguish real gaps (object has a layer
      // that doesn't use the slot) from spurious gaps (another object's layer).
 diff --git a/src/libslic3r/Preset.cpp b/src/libslic3r/Preset.cpp
-index 632b750..b1cf220 100644
+index 632b750..ce70eb3 100644
 --- a/src/libslic3r/Preset.cpp
 +++ b/src/libslic3r/Preset.cpp
 @@ -1059,6 +1059,14 @@ static std::vector<std::string> s_Preset_print_options {
@@ -580,7 +676,7 @@ index 632b750..b1cf220 100644
      "wipe_tower_no_sparse_layers", "compatible_printers", "compatible_printers_condition", "inherits",
      "flush_into_infill", "flush_into_objects", "flush_into_support","process_notes", "enable_mixed_color_sublayer",
 +    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap); default off.
-+    "image_map_per_layer_color_rotation",
++    "image_map_per_layer_color_rotation", "image_map_component_filaments",
 +    "image_map_wall_width_enable", "image_map_wall_width_allow_widening",
 +    "texture_mapping_outer_wall_gradient_global_strength",
 +    "texture_mapping_outer_wall_gradient_max_line_width", "texture_mapping_outer_wall_gradient_min_line_width",
@@ -591,7 +687,7 @@ index 632b750..b1cf220 100644
       "tree_support_branch_angle", "tree_support_wall_count", "tree_support_branch_distance", "tree_support_branch_diameter",
      "tree_support_branch_diameter_angle",
 diff --git a/src/libslic3r/PrintConfig.cpp b/src/libslic3r/PrintConfig.cpp
-index 7d8ab09..430501a 100644
+index 7d8ab09..08dc24b 100644
 --- a/src/libslic3r/PrintConfig.cpp
 +++ b/src/libslic3r/PrintConfig.cpp
 @@ -209,6 +209,13 @@ static t_config_enum_values s_keys_map_NoiseType {
@@ -608,7 +704,7 @@ index 7d8ab09..430501a 100644
  static t_config_enum_values s_keys_map_FuzzySkinMode {
      { "displacement", int(FuzzySkinMode::Displacement) },
      { "extrusion",    int(FuzzySkinMode::Extrusion) },
-@@ -6050,6 +6057,197 @@ void PrintConfigDef::init_fff_params()
+@@ -6050,6 +6057,211 @@ void PrintConfigDef::init_fff_params()
      def->mode = comSimple;
      def->set_default_value(new ConfigOptionBool(false));
  
@@ -619,12 +715,26 @@ index 7d8ab09..430501a 100644
 +    // a strict no-op and slicing output is unchanged.
 +    def = this->add("image_map_per_layer_color_rotation", coBool);
 +    def->label = L("Image-map per-layer color rotation");
-+    def->tooltip = L("Experimental. Collapse multi-color (painted) tool changes to at most one tool "
-+                     "change per layer, cycling through the painted filaments across layers, and "
-+                     "approximate the painted colors by modulating the outer wall line width. "
-+                     "Ported from OrcaSlicer-ImageMap.");
-+    def->mode = comDevelop;
++    def->category = L("Multimaterial");
++    def->tooltip = L("Experimental. Print a multi-color (painted) model with at most one tool change "
++                     "per layer: each layer is printed entirely in one filament, cycling through the "
++                     "rotation filaments across layers, and the painted colors are reproduced on the "
++                     "side walls by moving the outer wall in and out (see the wall map settings "
++                     "below). Ported from OrcaSlicer-ImageMap.");
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionBool(false));
++
++    def = this->add("image_map_component_filaments", coString);
++    def->label = L("Rotation filaments");
++    def->category = L("Multimaterial");
++    def->tooltip = L("The filaments the layers cycle through, as filament numbers in rotation order, "
++                     "e.g. \"1,2,3,4\" for cyan, magenta, yellow and white loaded in slots 1-4. "
++                     "Any other filament painted onto the model is then used only as a target color: "
++                     "it is never loaded, and its color is mixed from the rotation filaments "
++                     "instead, so a model can be painted in colors you do not have.\n"
++                     "Leave empty to rotate through every filament the model is painted with.");
++    def->mode = comAdvanced;
++    def->set_default_value(new ConfigOptionString(""));
 +
 +    // -----------------------------------------------------------------------
 +    // Wall map, toggle 1: vary the outer wall's LINE WIDTH.
@@ -642,7 +752,7 @@ index 7d8ab09..430501a 100644
 +                     "it cannot be applied to bridged/overhang material, so on sloped surfaces "
 +                     "some loops are left unmodulated unless 'Offset outer wall surface' is also "
 +                     "on to cover them.");
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionBool(false));
 +
 +    def = this->add("image_map_wall_width_allow_widening", coBool);
@@ -653,7 +763,7 @@ index 7d8ab09..430501a 100644
 +                     "well as inward, roughly doubling the color range, at the cost of growing the "
 +                     "model's outer dimensions by up to the surface travel cap (the nozzle "
 +                     "diameter, at most 0.35 mm). Only used when 'Vary outer wall line width' is on.");
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionBool(false));
 +
 +    // The following three options are ported verbatim from OrcaSlicer-ImageMap
@@ -668,7 +778,7 @@ index 7d8ab09..430501a 100644
 +    def->sidetext = "%";
 +    def->min = 0.0;
 +    def->max = 100.0;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionFloat(100.0));
 +
 +    def = this->add("texture_mapping_outer_wall_gradient_max_line_width", coFloat);
@@ -685,7 +795,7 @@ index 7d8ab09..430501a 100644
 +    def->sidetext = "mm";
 +    def->min = 0;
 +    def->max = 3.0;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionFloat(0));
 +
 +    def = this->add("texture_mapping_outer_wall_gradient_min_line_width", coFloat);
@@ -703,7 +813,7 @@ index 7d8ab09..430501a 100644
 +    def->sidetext = "mm";
 +    def->min = 0;
 +    def->max = 2.0;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionFloat(0));
 +
 +    // Generic solver configuration (defaults match the OrcaSlicer-ImageMap
@@ -714,7 +824,7 @@ index 7d8ab09..430501a 100644
 +    def->tooltip = L("0: closest mix, 1: blend closest two. Ported from OrcaSlicer-ImageMap.");
 +    def->min = 0;
 +    def->max = 1;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionInt(0));
 +
 +    def = this->add("image_map_generic_solver_mode", coInt);
@@ -722,7 +832,7 @@ index 7d8ab09..430501a 100644
 +    def->tooltip = L("0: RGB, 1: Oklab, 2: Oklab soft-cap, 255: slicer default. Ported from OrcaSlicer-ImageMap.");
 +    def->min = 0;
 +    def->max = 255;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionInt(255));
 +
 +    def = this->add("image_map_generic_solver_mix_model", coInt);
@@ -730,7 +840,7 @@ index 7d8ab09..430501a 100644
 +    def->tooltip = L("0: Pigment Painter, 1: prusa-fdm-mixer. Ported from OrcaSlicer-ImageMap.");
 +    def->min = 0;
 +    def->max = 1;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionInt(0));
 +
 +    // -----------------------------------------------------------------------
@@ -746,7 +856,7 @@ index 7d8ab09..430501a 100644
 +                     "case, so every external perimeter is treated alike - this is the safe "
 +                     "option on real models. Its cost is that a wall pushed outward opens an "
 +                     "equally sized gap behind it, against the wall it used to touch.");
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionBool(true));
 +
 +    def = this->add("image_map_wall_offset_distance", coFloat);
@@ -762,7 +872,7 @@ index 7d8ab09..430501a 100644
 +    def->sidetext = "mm";
 +    def->min = 0.0;
 +    def->max = 0.7;
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionFloat(0));
 +
 +    def = this->add("image_map_wall_offset_direction", coEnum);
@@ -784,7 +894,7 @@ index 7d8ab09..430501a 100644
 +    def->enum_labels.push_back(L("In and out"));
 +    def->enum_labels.push_back(L("Inward only"));
 +    def->enum_labels.push_back(L("Outward only"));
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionEnum<ImageMapWallOffsetDirection>(ImageMapWallOffsetDirection::Both));
 +
 +    // -----------------------------------------------------------------------
@@ -800,13 +910,13 @@ index 7d8ab09..430501a 100644
 +                     "the other half, for the strongest color effect the feature can produce "
 +                     "while staying printable. Loops that cannot take a width change (bridges and "
 +                     "overhangs) are still offset, so the surface stays uniform.");
-+    def->mode = comDevelop;
++    def->mode = comAdvanced;
 +    def->set_default_value(new ConfigOptionBool(false));
 +
      def = this->add("enable_prime_tower", coBool);
      def->label = L("Enable");
      def->tooltip = L("The wiping tower can be used to clean up the residue on the nozzle and stabilize the chamber pressure inside the nozzle, "
-@@ -7234,7 +7432,16 @@ void PrintConfigDef::init_sla_params()
+@@ -7234,7 +7446,16 @@ void PrintConfigDef::init_sla_params()
  void PrintConfigDef::handle_legacy(t_config_option_key &opt_key, std::string &value)
  {
      //BBS: handle legacy options
@@ -825,7 +935,7 @@ index 7d8ab09..430501a 100644
      } else if (opt_key == "wipe_tower_width") {
          opt_key = "prime_tower_width";
 diff --git a/src/libslic3r/PrintConfig.hpp b/src/libslic3r/PrintConfig.hpp
-index 0f1319c..ae2a276 100644
+index 0f1319c..06f5644 100644
 --- a/src/libslic3r/PrintConfig.hpp
 +++ b/src/libslic3r/PrintConfig.hpp
 @@ -70,6 +70,14 @@ enum class NoiseType {
@@ -851,12 +961,13 @@ index 0f1319c..ae2a276 100644
  CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinMode)
  CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(InfillPattern)
  CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(IroningType)
-@@ -1514,6 +1523,23 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
+@@ -1514,6 +1523,24 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
      ((ConfigOptionInts,               nozzle_temperature_range_high))
      ((ConfigOptionFloatsNullable,     wipe_distance))
      ((ConfigOptionBool,               enable_mixed_color_sublayer))
 +    // Image-map per-layer color rotation (ported from OrcaSlicer-ImageMap); default off.
 +    ((ConfigOptionBool,               image_map_per_layer_color_rotation))
++    ((ConfigOptionString,             image_map_component_filaments))
 +    // Wall map, toggle 1: modulate the outer wall's line width, + its settings.
 +    ((ConfigOptionBool,               image_map_wall_width_enable))
 +    ((ConfigOptionBool,               image_map_wall_width_allow_widening))

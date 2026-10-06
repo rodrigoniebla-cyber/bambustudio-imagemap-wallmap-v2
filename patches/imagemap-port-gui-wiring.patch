@@ -1,5 +1,5 @@
 diff --git a/src/slic3r/GUI/ConfigManipulation.cpp b/src/slic3r/GUI/ConfigManipulation.cpp
-index b9609b3..04ad0ba 100644
+index b9609b3..c836800 100644
 --- a/src/slic3r/GUI/ConfigManipulation.cpp
 +++ b/src/slic3r/GUI/ConfigManipulation.cpp
 @@ -1118,6 +1118,27 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
@@ -15,7 +15,7 @@ index b9609b3..04ad0ba 100644
 +    bool image_map_combined = image_map_on && config->opt_bool("image_map_wall_combined_preset");
 +    bool image_map_width    = image_map_on && !image_map_combined && config->opt_bool("image_map_wall_width_enable");
 +    bool image_map_offset   = image_map_on && !image_map_combined && config->opt_bool("image_map_wall_offset_enable");
-+    for (auto el : { "image_map_wall_combined_preset", "image_map_generic_solver_lookup_mode",
++    for (auto el : { "image_map_component_filaments", "image_map_wall_combined_preset", "image_map_generic_solver_lookup_mode",
 +                     "image_map_generic_solver_mode", "image_map_generic_solver_mix_model" })
 +        toggle_field(el, image_map_on);
 +    for (auto el : { "image_map_wall_width_enable", "image_map_wall_offset_enable" })
@@ -31,15 +31,16 @@ index b9609b3..04ad0ba 100644
  
  void ConfigManipulation::update_print_sla_config(DynamicPrintConfig* config, const bool is_global_config/* = false*/)
 diff --git a/src/slic3r/GUI/Tab.cpp b/src/slic3r/GUI/Tab.cpp
-index 5b7ec39..4172373 100644
+index 5b7ec39..1df0dd7 100644
 --- a/src/slic3r/GUI/Tab.cpp
 +++ b/src/slic3r/GUI/Tab.cpp
-@@ -3527,6 +3527,24 @@ void TabPrint::build()
+@@ -3527,6 +3527,25 @@ void TabPrint::build()
          optgroup->append_single_option_line("solid_infill_filament");
          optgroup->append_single_option_line("wall_filament");
  
 +        optgroup = page->new_optgroup(L("Image map per-layer color (experimental)"), L"param_special");
 +        optgroup->append_single_option_line("image_map_per_layer_color_rotation");
++        optgroup->append_single_option_line("image_map_component_filaments");
 +        // Wall map, toggle 1: vary the line width, and its settings.
 +        optgroup->append_single_option_line("image_map_wall_width_enable");
 +        optgroup->append_single_option_line("image_map_wall_width_allow_widening");

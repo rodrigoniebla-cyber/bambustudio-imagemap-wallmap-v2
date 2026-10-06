@@ -101,25 +101,31 @@ and commit; all original license headers are intact below the provenance note.
 
 | File | Change |
 |---|---|
-| `src/libslic3r/PrintConfig.cpp/.hpp` | 12 new options (below), all `comDevelop`, defaults inert; the `ImageMapWallOffsetDirection` enum and its config-enum maps; `handle_legacy()` drops the two superseded wall-mode keys |
-| `src/libslic3r/Preset.cpp` | The 12 keys added to the print-options list |
-| `src/libslic3r/GCode/ToolOrdering.hpp` | `LayerTools::image_map_filament_resolution` map + identity `resolve_image_map()`; declaration + rotation accessor |
+| `src/libslic3r/PrintConfig.cpp/.hpp` | 14 new options (below), all `comAdvanced` (visible in Advanced mode, no Develop mode needed), defaults inert; the `ImageMapWallOffsetDirection` enum and its config-enum maps; `handle_legacy()` drops the two superseded wall-mode keys |
+| `src/libslic3r/Preset.cpp` | The 14 keys added to the print-options list |
+| `src/libslic3r/GCode/ToolOrdering.hpp` | `LayerTools::image_map_filament_resolution` map + identity `resolve_image_map()`; `LayerTools::image_map_rotation` (the layer's rotation, read by GCode); declaration + rotation accessor |
 | `src/libslic3r/GCode/ToolOrdering.cpp` | The four `resolve_mixed(result)` sites become `resolve_image_map(resolve_mixed(result))`; `resolve_image_map_per_layer_filaments()` called from both `sort_and_build_data` overloads right after `resolve_mixed_filaments()` |
 | `src/libslic3r/GCode.hpp/.cpp` | Solver member + `init_image_map_per_layer_color()` (called once in `do_export`) + `image_map_modulate_outer_wall_loop()`, called on the by-value loop copy at the top of `extrude_loop()`. **Phase 2 replaced Phase 1's `_extrude` shim with this**: `_extrude()` is back to its original signature and body |
 | `src/CMakeLists.txt`, `src/libslic3r/CMakeLists.txt` | `add_subdirectory` for the three vendored libs; `colorsolver` added to `libslic3r`'s link list; new module sources registered |
-| `src/slic3r/GUI/Tab.cpp` (`patches/imagemap-port-gui-wiring.patch`, applied separately by `apply.sh`) | New "Image map per-layer color (experimental)" optgroup in Process Settings > Others, wiring all 12 options into the UI (visible once Preferences > Develop mode is on; previously the options existed only in the config schema with no UI control) |
+| `src/slic3r/GUI/Tab.cpp` (`patches/imagemap-port-gui-wiring.patch`, applied separately by `apply.sh`) | New "Image map per-layer color (experimental)" optgroup in Process Settings > Others, wiring all 14 options into the UI (visible in Advanced mode) |
 | `src/slic3r/GUI/ConfigManipulation.cpp` (same patch) | `toggle_print_fff_options()` greys out every wall-map setting that does not currently apply: everything under the master toggle, each half's settings under its own toggle, and both halves entirely when the combined preset is on |
 
 ## The default-off toggle
 
 * **`image_map_per_layer_color_rotation`** (`coBool`, default **false**,
-  `comDevelop`) — master switch, defined in `PrintConfig.cpp`. Checked by
+  `comAdvanced`) — master switch, defined in `PrintConfig.cpp`. Checked by
   `ImageMapPerLayer::enabled()`; every feature entry point returns immediately
   when it is false.
 * Supporting options (all inert unless the master switch is on). The wall map —
   everything that decides how the outer wall approximates the painted colour —
   is three independent toggles, each owning its own settings; see
   [The wall map's three toggles](#the-wall-maps-three-toggles):
+  * **`image_map_component_filaments`** (string, default empty) — the
+    rotation filaments, the origin's zone component list: filament numbers in
+    rotation order, e.g. `1,2,3,4`. Painted filaments not in the list are colour
+    targets only (never loaded, mixed from the list). Empty = rotate through
+    every filament the model is painted with. See
+    [Rotation filaments](#rotation-filaments-painting-colours-you-have-not-loaded).
   * **Toggle 1 — `image_map_wall_width_enable`** (bool, default **false**):
     vary the outer wall's line width. Its settings:
     * `image_map_wall_width_allow_widening` (bool, default false) — let the wall
@@ -172,7 +178,7 @@ Every touched code path, traced with the toggle off:
 
 **One honest caveat on "bit-for-bit":** exported G-code embeds the full print
 config as `; key = value` comment lines between `CONFIG_BLOCK_START/END`
-(`GCode::append_full_config` dumps every key). The 7 new keys therefore add 7
+(`GCode::append_full_config` dumps every key). The 14 new keys therefore add 14
 comment lines to that metadata block even when the feature is disabled. This is
 inherent to adding any config option to Bambu Studio (the upstream
 mixed-filament feature has the same effect) and has zero effect on toolpaths,
@@ -572,6 +578,71 @@ spike.
   average, so it is a no-op by construction and was not ported.
 * Loops whose paths do not all share one width, or whose junctions are not
   exact, are skipped rather than approximated.
+
+## Phase 2.1: fixes and rotation filaments
+
+### Rotation filaments: painting colours you have not loaded
+
+The origin's whole point is printing colours you do not own: a texture-mapping
+zone names its *component* filaments (C, M, Y, K, W…), every layer is printed in
+one of them, and any colour on the model is produced by how far each layer's
+wall stands out. Until now the port had no equivalent. It derived the rotation
+from every filament painted onto the model, so every painted colour was itself
+a rotation filament and had to be physically loaded; the solver always found
+that colour among the components with weight ≈ 1, and the feature could never
+produce anything but the loaded colours.
+
+`image_map_component_filaments` (Process > Others > Image map, "Rotation
+filaments") is that component list. With `1,2,3,4` set and a model painted with
+filaments 1–7:
+
+* `ToolOrdering` rotates layers through filaments 1→2→3→4, in that order, and
+  remaps *every* body filament (1–7) onto the layer's active one, so 5–7 never
+  appear in the G-code and never need an AMS slot;
+* the wall map solves each region's colour — filament 5's orange, say — over
+  the four components and offsets/re-widths the wall accordingly.
+
+Left empty, behaviour is unchanged (every painted filament rotates). Parsing is
+`ImageMapPerLayer::parse_component_filaments()`; numbers out of range,
+duplicates and non-numeric tokens are dropped; support filaments are never
+rotated.
+
+### Bug: print-by-object printed plain stripes
+
+`GCode::init_image_map_per_layer_color()` read the rotation from
+`print.tool_ordering()`. In a by-object (sequential) print that object is
+empty — each object gets its own `ToolOrdering` in `ByObjectPrintData` — while
+those per-object orderings *do* collapse tool changes. Result: one filament per
+layer, no wall map at all, i.e. horizontal stripes of filament colour. The
+rotation is now carried per layer (`LayerTools::image_map_rotation`), set in
+`GCode::process_layer()`, and solvers are kept per rotation set
+(`GCode::image_map_solver_for_layer()`), which handles by-layer and by-object
+prints the same way and keeps both halves of the feature reading the same set.
+
+### Misport: the width half's swing was half the origin's
+
+The origin bounds the outer-wall width change by
+`min(effective_delta, 2 * max_allowed_distance)` (origin `GCode.cpp:11200`):
+twice the surface cap, because the paired centerline shift is half the width
+change and so stays inside the cap. The port bounded the *surface travel* by
+one cap, halving that. On a standard 0.42 mm wall the extrusion floor binds
+first, so nothing changes there; on a wide outer wall it matters. The bounds
+are now the origin's: the surface may recede up to `2·cap` and stand out up to
+`cap`, and the toolpath centerline never moves more than `cap` (the same
+ceiling `offset_closed_ring()` is given).
+
+This makes the origin's own default geometry reproducible: its image-texture
+mode prints the outer wall at 0.95 mm and narrows it to 0.32 mm (a 0.63 mm
+swing), reserving the room by insetting the slice. Setting **Outer wall line
+width = 0.95 mm**, enabling **Vary outer wall line width** (narrow-only) with
+min 0.32 mm reserves the same room in the perimeter generator and produces the
+same 0.63 mm swing with the inner edge pinned — covered by a unit test.
+
+### Settings visible without Develop mode
+
+All options moved from `comDevelop` to `comAdvanced`: switch the settings
+panel to Advanced and the "Image map per-layer color (experimental)" group
+appears under Process > Others.
 
 ## Out of scope (Phase 3)
 

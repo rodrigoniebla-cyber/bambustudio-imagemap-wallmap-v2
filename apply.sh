@@ -34,5 +34,5 @@ for PATCH in \
 done
 
 echo "Done. Feature toggle: image_map_per_layer_color_rotation (default off)."
-echo "GUI: Preferences > Develop mode, then Process Settings > Others > 'Image map per-layer color (experimental)'."
+echo "GUI: switch the settings panel to Advanced, then Process Settings > Others > 'Image map per-layer color (experimental)'."
 echo "Test: cmake -DSLIC3R_BUILD_TESTS=ON <build dir>, then build+run the 'imagemap_tests' target."

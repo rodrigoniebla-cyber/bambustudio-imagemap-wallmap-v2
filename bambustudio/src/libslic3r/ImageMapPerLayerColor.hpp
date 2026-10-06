@@ -75,6 +75,14 @@ bool enabled(const PrintConfig &config);
 // volume/paint-based approximation here.
 std::vector<unsigned int> rotation_filaments(const Print &print);
 
+// Parse image_map_component_filaments: 1-based filament numbers separated by
+// commas, spaces or semicolons ("1,2,3,4"). Returns them 0-based, in the order
+// given (that order is the layer rotation order, as with the origin's zone
+// component list), with duplicates, out-of-range numbers and anything that is
+// not a number dropped. Empty input yields an empty list, meaning "derive the
+// rotation from what the layers print".
+std::vector<unsigned int> parse_component_filaments(const std::string &text, size_t num_filaments);
+
 // Balanced per-layer sequence over the rotation set.
 // Port of build_balanced_component_sequence() (TextureMapping.cpp); Phase 1
 // uses equal weights, which yields a plain cycle (e.g. C->M->Y->K->C->...).

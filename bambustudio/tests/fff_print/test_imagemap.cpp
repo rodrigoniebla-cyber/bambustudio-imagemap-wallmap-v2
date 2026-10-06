@@ -3,10 +3,19 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/ImageMapPerLayerColor.hpp"
+#include "libslic3r/GCode/ToolOrdering.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/Utils.hpp"
+
+#include <boost/filesystem.hpp>
 
 #include "test_data.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
@@ -258,11 +267,20 @@ TEST_CASE("imagemap: surface movement is capped at the nozzle-derived limit", "[
     REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(0.20f) == Approx(0.20f));
     REQUIRE(Slic3r::ImageMapPerLayer::max_surface_offset_mm(1.00f) == Approx(kCap));
 
+    // The origin's bounds: the surface moves out by at most cap and in by at
+    // most 2 * cap (a width change of 2 * cap, whose paired centerline shift is
+    // cap), and the centerline itself never moves by more than cap.
+    auto within_bounds = [](const WallModulation &m) {
+        return m.surface_offset_mm <= kCap + 1e-3f && m.surface_offset_mm >= -2.f * kCap - 1e-3f &&
+               std::abs(m.centerline_shift_mm) <= kCap + 1e-3f;
+    };
     // An absurd configured max must not translate into an absurd excursion,
     // in any combination of the two halves.
     for (int i = 0; i <= 10; ++i) {
         const float w = float(i) / 10.f;
-        REQUIRE(std::abs(width_only(w, true, 100.f, 0.05f, 3.0f).surface_offset_mm) <= kCap + 1e-3f);
+        REQUIRE(within_bounds(width_only(w, true, 100.f, 0.05f, 3.0f)));
+        // The offset half alone moves the whole wall, so it is bound by the
+        // centerline limit: never more than cap either way.
         REQUIRE(std::abs(offset_only(w, 10.0f, WallOffsetDirection::Both).surface_offset_mm) <= kCap + 1e-3f);
         REQUIRE(std::abs(offset_only(w, 10.0f, WallOffsetDirection::Inward).surface_offset_mm) <= kCap + 1e-3f);
         REQUIRE(std::abs(offset_only(w, 10.0f, WallOffsetDirection::Outward).surface_offset_mm) <= kCap + 1e-3f);
@@ -277,8 +295,35 @@ TEST_CASE("imagemap: surface movement is capped at the nozzle-derived limit", "[
         s.offset_surface      = true;
         s.offset_distance_mm  = 10.0f;
         const WallModulation m = Slic3r::ImageMapPerLayer::compute_wall_modulation(w, kNominal, s);
-        REQUIRE(std::abs(m.surface_offset_mm) <= kCap + 1e-3f);
+        REQUIRE(within_bounds(m));
+
+        // Same on a wide wall, where the width half alone can reach both limits.
+        s.offset_direction = WallOffsetDirection::Inward;
+        REQUIRE(within_bounds(Slic3r::ImageMapPerLayer::compute_wall_modulation(w, 0.95f, s)));
     }
+}
+
+// The origin's default for image textures (vertex-colour match) prints the
+// outer wall at texture_mapping_outer_wall_gradient_max_line_width, 0.95 mm,
+// and narrows it to 0.32 mm on layers whose filament is not wanted: a 0.63 mm
+// swing, min(0.95 - 0.32, 2 * 0.35). With the outer wall line width set to
+// 0.95 mm (so the perimeter generator reserves the room the origin reserves by
+// insetting the slice), narrow-only width modulation must reproduce that.
+TEST_CASE("imagemap: a wide outer wall gets the origin's full width swing", "[ImageMapPerLayerColor]")
+{
+    WallModulationSettings s = base_settings();
+    s.modulate_width      = true;
+    s.allow_widening      = false;
+    s.config_min_width_mm = 0.32f;
+    s.config_max_width_mm = 0.95f;
+    const WallModulation full = Slic3r::ImageMapPerLayer::compute_wall_modulation(1.f, 0.95f, s);
+    const WallModulation none = Slic3r::ImageMapPerLayer::compute_wall_modulation(0.f, 0.95f, s);
+    REQUIRE(!full.active);
+    REQUIRE(none.active);
+    REQUIRE(none.width_mm == Approx(0.32f).margin(1e-4));
+    REQUIRE(none.surface_offset_mm == Approx(-0.63f).margin(1e-4));
+    REQUIRE(none.centerline_shift_mm == Approx(0.315f).margin(1e-4));
+    REQUIRE(none.centerline_shift_mm <= kCap);
 }
 
 TEST_CASE("imagemap: zero strength disables the width half without disabling the offset half", "[ImageMapPerLayerColor]")
@@ -702,4 +747,227 @@ TEST_CASE("imagemap: offset_closed_ring() refuses to collapse or invert a ring",
     const coord_t s = coord_t(scale_(10.));
     Points square{Point(0, 0), Point(s, 0), Point(s, s), Point(0, s)};
     REQUIRE(!Slic3r::ImageMapPerLayer::offset_closed_ring(square, 0., offset));
+}
+
+// ---------------------------------------------------------------------------
+// Rotation filaments (the origin's zone components) and colour targets that
+// are not themselves in the rotation.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("imagemap: parse_component_filaments() reads 1-based lists in order", "[ImageMapPerLayerColor]")
+{
+    using Slic3r::ImageMapPerLayer::parse_component_filaments;
+    using V = std::vector<unsigned int>;
+    REQUIRE(parse_component_filaments("", 4).empty());
+    REQUIRE(parse_component_filaments("   ", 4).empty());
+    // Order is kept: it is the layer rotation order.
+    REQUIRE(parse_component_filaments("1,2,3,4", 4) == V{0, 1, 2, 3});
+    REQUIRE(parse_component_filaments("4 2;1", 4) == V{3, 1, 0});
+    REQUIRE(parse_component_filaments(" 3 , 1 ", 4) == V{2, 0});
+    // Duplicates, out-of-range numbers and non-numeric tokens are dropped
+    // whole -- "F2" must not turn into a stray filament 2, nor "-1" into 1.
+    REQUIRE(parse_component_filaments("1,1,2", 4) == V{0, 1});
+    REQUIRE(parse_component_filaments("0,5,2", 4) == V{1});
+    REQUIRE(parse_component_filaments("F2,-1,3x,abc,4", 4) == V{3});
+    REQUIRE(parse_component_filaments("99999999999999999999,1", 4) == V{0});
+}
+
+TEST_CASE("imagemap: a painted colour outside the rotation is mixed from the rotation filaments", "[ImageMapPerLayerColor]")
+{
+    // Slots 1-4 are loaded with red, green, blue and yellow; slot 5 is orange,
+    // painted onto the model but never loaded -- a colour target only.
+    DynamicPrintConfig dyn = DynamicPrintConfig::full_print_config();
+    dyn.set_num_filaments(5);
+    dyn.set_key_value("filament_colour",
+                      new ConfigOptionStrings({"#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF8000"}));
+    PrintConfig config;
+    config.apply(dyn, true);
+
+    Slic3r::ImageMapPerLayer::Solver solver;
+    const std::vector<unsigned int> rotation = {0, 1, 2, 3};
+    REQUIRE(solver.init(config, rotation));
+    REQUIRE_FALSE(solver.in_rotation(4));
+
+    float sum = 0.f;
+    std::vector<float> w;
+    for (unsigned int active : rotation) {
+        const float weight = solver.weight_for(4, active);
+        REQUIRE(weight >= 0.f);
+        REQUIRE(weight <= 1.f);
+        w.push_back(weight);
+        sum += weight;
+    }
+    REQUIRE(sum == Approx(1.f).margin(1e-3));
+    // Orange is red and yellow, not green or blue.
+    REQUIRE(w[0] + w[3] > 0.6f);
+    REQUIRE(w[2] < 0.2f);
+
+    // A rotation filament still solves to (nearly) itself.
+    REQUIRE(solver.weight_for(2, 2) > 0.8f);
+    // A filament that is not in the rotation can never be the active one.
+    REQUIRE(solver.weight_for(0, 4) < 0.f);
+}
+
+// ---------------------------------------------------------------------------
+// End to end: slice and export real G-code. Two 20 mm cubes, one per filament,
+// with the feature on. Every layer must collapse to one filament, and turning
+// the wall map on must actually change the G-code -- in a by-layer print *and*
+// in a by-object one, where each object has its own ToolOrdering and the wall
+// map used to find no rotation at all (collapsed tool changes, no modulation:
+// plain stripes).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+DynamicPrintConfig make_e2e_config(bool by_object, bool wall_map, const std::string &components = "")
+{
+    DynamicPrintConfig config = make_imagemap_config(4, true);
+    config.set_key_value("enable_prime_tower", new ConfigOptionBool(false));
+    config.set_key_value("print_sequence", new ConfigOptionEnum<PrintSequence>(by_object ? PrintSequence::ByObject : PrintSequence::ByLayer));
+    config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
+    config.set_key_value("initial_layer_print_height", new ConfigOptionFloat(0.2));
+    config.set_key_value("image_map_wall_offset_enable", new ConfigOptionBool(wall_map));
+    config.set_key_value("image_map_wall_width_enable", new ConfigOptionBool(false));
+    config.set_key_value("image_map_wall_combined_preset", new ConfigOptionBool(false));
+    config.set_key_value("image_map_component_filaments", new ConfigOptionString(components));
+    // Per-filament settings with extruder variants are indexed through
+    // filament_self_index / filament_extruder_variant; set_num_filaments()
+    // leaves those at one entry, which silently gives filaments 2+ no
+    // settings at all (and no perimeters or infill).
+    const std::string variant = config.option<ConfigOptionStrings>("filament_extruder_variant")->values.front();
+    config.set_key_value("filament_extruder_variant", new ConfigOptionStrings(std::vector<std::string>(4, variant)));
+    config.set_key_value("filament_self_index", new ConfigOptionInts({1, 2, 3, 4}));
+    config.set_key_value("filament_map", new ConfigOptionInts({1, 1, 1, 1}));
+    return config;
+}
+
+void build_e2e_print(Print &print, Model &model, const DynamicPrintConfig &config_in, const std::vector<int> &extruders)
+{
+    model.clear_objects();
+    for (size_t i = 0; i < extruders.size(); ++i) {
+        add_cube_object(model, 40.0 + 120.0 * double(i), extruders[i]);
+        model.objects.back()->instances.front()->set_offset(Vec3d(40.0 + 120.0 * double(i), 100.0, 0.0));
+    }
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_num_filaments(config_in.option<ConfigOptionFloats>("filament_diameter")->size());
+    config.apply(config_in);
+    // Upstream ConfigOptionEnumsGeneric(std::initializer_list<int>) initialises
+    // keys_map from itself, so a vector-enum option holding its definition's
+    // default carries a garbage keys map and crashes the first time G-code
+    // export serialises it. The app never sees this (it builds options from
+    // presets via the definition); a test using raw defaults does. Restore
+    // their keys maps from the definitions.
+    for (const std::string &key : config.keys()) {
+        const ConfigOptionDef *def = config.def()->get(key);
+        if (def == nullptr || def->type != coEnums || def->enum_keys_map == nullptr)
+            continue;
+        ConfigOption *opt = config.option(key);
+        if (def->nullable)
+            static_cast<ConfigOptionEnumsGenericNullable *>(opt)->keys_map = def->enum_keys_map;
+        else
+            static_cast<ConfigOptionEnumsGeneric *>(opt)->keys_map = def->enum_keys_map;
+    }
+    for (ModelObject *mo : model.objects)
+        mo->ensure_on_bed();
+    print.apply(model, config);
+    print.set_status_silent();
+}
+
+// Slice and export, reporting the slicer's own error messages on failure.
+std::string slice_to_gcode(Print &print)
+{
+    // G-code export writes temporaries under data_dir(), which a test binary
+    // does not otherwise have.
+    if (Slic3r::data_dir().empty() || !boost::filesystem::exists(Slic3r::data_dir())) {
+        const boost::filesystem::path dir = boost::filesystem::temp_directory_path() / "imagemap_tests_data";
+        boost::filesystem::create_directories(dir);
+        Slic3r::set_data_dir(dir.string());
+    }
+    try {
+        // Not Slic3r::Test::gcode(): it exports to a bare relative file name,
+        // whose empty parent directory GCode::do_export() then fails to create.
+        const boost::filesystem::path path = boost::filesystem::temp_directory_path() /
+                                             boost::filesystem::unique_path("imagemap-%%%%-%%%%.gcode");
+        print.set_status_silent();
+        print.process();
+        // do_export() dereferences the processor result unconditionally.
+        GCodeProcessorResult result;
+        print.export_gcode(path.string(), &result, nullptr);
+        std::ifstream in(path.string());
+        std::string gcode((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        boost::filesystem::remove(path);
+        return gcode;
+    } catch (const Slic3r::SlicingErrors &errors) {
+        std::string msg;
+        for (const Slic3r::SlicingError &e : errors.errors_)
+            msg += std::string(e.what()) + "; ";
+        FAIL("slicing failed: " << msg);
+    }
+    return {};
+}
+
+// Count the G-code tool selections ("T<n>" at the start of a line).
+size_t count_tool_changes(const std::string &gcode)
+{
+    size_t count = 0;
+    std::istringstream in(gcode);
+    std::string line;
+    while (std::getline(in, line))
+        if (line.size() >= 2 && line[0] == 'T' && std::isdigit(static_cast<unsigned char>(line[1])))
+            ++count;
+    return count;
+}
+
+// Every layer of every tool ordering the print uses extrudes exactly one body filament.
+void require_one_filament_per_layer(const Print &print, const std::vector<unsigned int> &expected_rotation)
+{
+    std::vector<const ToolOrdering *> orderings;
+    if (print.is_sequential_print()) {
+        REQUIRE(print.sequential_print_data().has_value());
+        for (const auto &kv : print.sequential_print_data()->object_tool_ordering_map)
+            orderings.push_back(&kv.second);
+    } else {
+        orderings.push_back(&print.tool_ordering());
+    }
+    REQUIRE(!orderings.empty());
+    for (const ToolOrdering *ordering : orderings) {
+        REQUIRE(ordering->image_map_rotation_filaments() == expected_rotation);
+        for (const LayerTools &lt : ordering->layer_tools()) {
+            if (lt.extruders.empty())
+                continue;
+            REQUIRE(lt.extruders.size() == 1);
+            REQUIRE(lt.image_map_rotation == expected_rotation);
+            REQUIRE(std::find(expected_rotation.begin(), expected_rotation.end(), lt.extruders.front()) != expected_rotation.end());
+        }
+    }
+}
+
+} // namespace
+
+TEST_CASE("imagemap: end to end, rotation filaments drive collapsing and the wall map, by layer and by object", "[ImageMapPerLayerColor]")
+{
+    for (bool by_object : {false, true}) {
+        SECTION(by_object ? "by object" : "by layer") {
+            // Two cubes painted (assigned) filament 1; the rotation is 1, 2, 3.
+            // Every layer must be printed in exactly one of 1-3, cycling, and
+            // turning the wall map on must change the G-code -- by object as
+            // well, where each cube has its own ToolOrdering and the wall map
+            // used to find no rotation at all (collapsed tool changes, no
+            // modulation: plain stripes of filament colour).
+            Model model_off, model_on;
+            Print print_off, print_on;
+            build_e2e_print(print_off, model_off, make_e2e_config(by_object, false, "1,2,3"), {1, 1});
+            build_e2e_print(print_on, model_on, make_e2e_config(by_object, true, "1,2,3"), {1, 1});
+            const std::string gcode_off = slice_to_gcode(print_off);
+            const std::string gcode_on  = slice_to_gcode(print_on);
+            REQUIRE(!gcode_off.empty());
+            require_one_filament_per_layer(print_on, {0, 1, 2});
+            REQUIRE(gcode_on.find("\nT3\n") == std::string::npos);
+            REQUIRE(gcode_on != gcode_off);
+            // The wall map moves walls; it never adds or removes tool changes.
+            REQUIRE(count_tool_changes(gcode_on) == count_tool_changes(gcode_off));
+            REQUIRE(count_tool_changes(gcode_on) > 0);
+        }
+    }
 }
