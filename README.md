@@ -19,3 +19,32 @@ into [Bambu Studio](https://github.com/bambulab/BambuStudio).
 
 The feature ships **off by default** behind the
 `image_map_per_layer_color_rotation` print setting.
+
+## How to use it
+
+1. Load the filaments you want to mix from into the AMS, e.g. cyan, magenta,
+   yellow and white in slots 1–4.
+2. Paint the model with any colours you like (Bambu's normal colour painting,
+   or an imported colour OBJ/3MF). Painted colours do **not** have to be
+   loaded: add them as extra filaments in the project's filament list.
+3. Switch the settings panel to **Advanced**, open **Process > Others >
+   Image map per-layer color (experimental)** and:
+   * tick **Image-map per-layer color rotation**;
+   * set **Rotation filaments** to the loaded slots, in order, e.g. `1,2,3,4`
+     (leave empty to rotate through every painted filament instead);
+   * pick the wall map: **Offset outer wall surface** (default, safest),
+     **Vary outer wall line width**, or **Combined (preset)** for the
+     strongest effect.
+4. Slice. Every layer is printed in one rotation filament (one tool change per
+   layer); the outer wall moves in and out per layer so each painted region
+   reads as its colour from the side.
+
+For the original OrcaSlicer-ImageMap geometry (a 0.95 mm outer wall narrowed
+to 0.32 mm on layers whose filament isn't wanted), set **Outer wall line
+width** to 0.95 mm and use **Vary outer wall line width** with minimum
+0.32 mm, widening off.
+
+What is *not* ported (see `PORT_SUMMARY.md`, "Out of scope"): image/texture
+import and projection, per-pixel texture sampling and dithering, gradients,
+top-surface image printing, and prime-tower images. Colours come from
+painted regions, one colour per region.
